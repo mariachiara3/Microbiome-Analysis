@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+import re
+from collections import defaultdict
+import glob
+import os
+
+# ----------------------------
+# Helper function: compute alignment length from CIGAR
+# ----------------------------
+def calc_alignment_length(cigar):
+    return sum(int(length) for length, op in re.findall(r'(\d+)([MD=X])', cigar))
+
+# ----------------------------
+# Main SAM processing function
+# ----------------------------
+def process_sam(input_file, output_file, min_len=1300, max_len=1700):
+    best_hit_per_read = {}
+    unaligned_reads = 0
+    full_length_count = 0
+    ref_counts = defaultdict(int)
+    discarded_lengths = []
+    discarded_ids = []
+
+    with open(input_file, 'r', encoding='utf-8') as f_in:
+        for line in f_in:
+            if line.startswith('@'):
+                continue
+
+            fields = line.strip().split('\t')
+            if len(fields) < 11:
+                continue
+
+            read_id = fields[0]
+            cigar = fields[5]
+            ref_id = fields[2]
+
+            if cigar == '*':
+                unaligned_reads += 1
+                continue
+
+            AS_values = [int(x[5:]) for x in fields if x.startswith('AS:i:')]
+            if not AS_values:
+                continue
+            AS = AS_values[0]
+
+            aln_len = calc_alignment_length(cigar)
+
+            if read_id not in best_hit_per_read or AS > best_hit_per_read[read_id][0]:
+                best_hit_per_read[read_id] = (AS, aln_len, ref_id)
+
+    with open(output_file, 'w', encoding='utf-8') as f_out:
+        for read_id, (AS, aln_len, ref_id) in best_hit_per_read.items():
+            if min_len <= aln_len <= max_len:
+                full_length_count += 1
+                ref_counts[ref_id] += 1
+            else:
+                discarded_lengths.append(aln_len)
+                if len(discarded_ids) < 2:
+                    discarded_ids.append(read_id)
+
+        for ref_id, count in ref_counts.items():
+            f_out.write(f"{ref_id}\t{count}\n")
+
+    sample_name = os.path.basename(input_file)
+    print(f"Sample: {sample_name} → Full-length reads: {full_length_count}")
+    print(f"Unaligned reads (CIGAR='*'): {unaligned_reads}")
+    if discarded_ids:
+        print(f"First 2 discarded reads: {', '.join(discarded_ids)}")
+    print("-" * 60)
+
+# ----------------------------
+# Run on all SAM files in folder
+# ----------------------------
+sam_folder = "path/to/sam_folder"
+
+for input_file in glob.glob(os.path.join(sam_folder, "*.sam")):
+    filename = os.path.basename(input_file)
+    number, ext = os.path.splitext(filename)
+    if number.isdigit() and 27 <= int(number) <= 43:
+        output_file = os.path.splitext(input_file)[0] + ".txt"
+        process_sam(input_file, output_file)
