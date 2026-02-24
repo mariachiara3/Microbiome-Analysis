@@ -1,0 +1,912 @@
+#!/usr/bin/env python3
+"""
+Nanopore full-length 16S microbiome pipeline (abundance + diversity)
+
+Inputs
+------
+1) Per-sample taxa tables:
+   *_subsampled_taxa.txt files inside treatment folders (e.g., adult_control/)
+
+   Expected tab-separated columns (no header):
+   taxonomy <tab> count <tab> read_ids
+
+2) Rarefied/subsampled count table for diversity (CSV):
+   rows = samples, columns = taxa/ASVs/OTUs (counts), index_col=0
+
+Outputs
+-------
+- Stacked barplots (individual samples + mean per treatment) at genus/species
+- Alpha diversity boxplots (Shannon, Simpson) per metric (one plot each)
+- Beta diversity PCoA plots (Bray-Curtis, Jaccard) per metric (one plot each)
+- Global + pairwise statistics tables + significant summary report (FDR on all post-hoc p-values)
+
+Note: This script assumes sample names contain treatment keywords (see extract_treatment()).
+"""
+
+from __future__ import annotations
+
+import os
+import argparse
+from itertools import cycle, combinations
+from typing import Dict, List, Tuple
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from scipy.spatial.distance import pdist, squareform
+from scipy.linalg import eigh
+from scipy.stats import chi2, kruskal, ranksums
+from matplotlib.patches import Ellipse
+from statsmodels.stats.multitest import multipletests
+
+
+# -----------------------------
+# Color configuration
+# -----------------------------
+
+FIXED_COLOR_MAP_GENUS: Dict[str, str] = {
+    "midichloria": "#1b9e77",
+    "brevibacterium": "#d95f02",
+    "burkholderia": "#7570b3",
+    "leifsonia": "#e7298a",
+    "cryocola": "#66a61e",
+    "staphylococcus": "#e6ab02",
+    "tomitella": "#a6761d",
+    "bacteroides": "#666666",
+    "dietzia": "#17becf",
+}
+
+DEFAULT_PALETTE = plt.cm.tab20.colors
+OTHER_COLOR = "#333333"
+
+TREATMENT_PALETTE: Dict[str, str] = {
+    "Control": "#1b9e77",
+    "Bleach": "#d95f02",
+    "DNA/RNA Zap": "#7570b3",
+    "Ethanol": "#e7298a",
+    "Lyzo_Zap": "#66a61e",
+    "Lyzo_Bleach": "#e6ab02",
+}
+
+ORDERED_TREATMENTS: List[str] = [
+    "Control",
+    "Ethanol",
+    "Bleach",
+    "DNA/RNA Zap",
+    "Lyzo_Zap",
+    "Lyzo_Bleach",
+]
+
+
+# Map folder basename -> human-readable treatment label
+FULL_FOLDER_NAME_MAPPING: Dict[str, str] = {
+    "adulti_controllo": "Control",
+    "adulti_etanolo": "Ethanol",
+    "adulti_candeggina": "Bleach",
+    "adulti_zap": "DNA/RNA Zap",
+    "adulti_lyzo_zap": "Lyzo_Zap",
+    "adulti_lyzo_cand": "Lyzo_Bleach",
+    "ninfe_controllo": "Control",
+    "ninfe_etanolo": "Ethanol",
+    "ninfe_candeggina": "Bleach",
+    "ninfe_zap": "DNA/RNA Zap",
+    "ninfe_lyzo_zap": "Lyzo_Zap",
+    "ninfe_lyzo_cand": "Lyzo_Bleach",
+}
+
+# Map short treatment key extracted from sample name -> human-readable label
+SHORT_TREATMENT_MAPPING: Dict[str, str] = {
+    "controllo": "Control",
+    "etanolo": "Ethanol",
+    "candeggina": "Bleach",
+    "zap": "DNA/RNA Zap",
+    "lyzo_zap": "Lyzo_Zap",
+    "lyzo_cand": "Lyzo_Bleach",
+}
+
+
+# -----------------------------
+# Abundance helpers
+# -----------------------------
+
+def calculate_relative_abundance_matrix(df: pd.DataFrame, category: str) -> pd.DataFrame:
+    df_grouped = df.groupby([category, "sample"])["count"].sum().reset_index()
+    df_pivot = df_grouped.pivot_table(index=category, columns="sample", values="count", fill_value=0)
+    return df_pivot.div(df_pivot.sum(axis=0), axis=1)
+
+
+def prepare_top_taxa_data(df_pivot_rel: pd.DataFrame, top_n: int = 10) -> pd.DataFrame:
+    df_temp = df_pivot_rel.drop(index="Unclassified_Taxa", errors="ignore")
+    taxa_totals = df_temp.sum(axis=1)
+    top_taxa = taxa_totals.sort_values(ascending=False).head(top_n).index
+    taxa_to_sum = df_pivot_rel.index.difference(top_taxa)
+
+    df_top = df_pivot_rel.loc[top_taxa].copy()
+    df_other = df_pivot_rel.loc[taxa_to_sum].sum(axis=0)
+    df_top.loc["Other/Unclassified"] = df_other
+    return df_top
+
+
+def get_all_top_taxa(df_list: List[pd.DataFrame], category: str, top_n: int) -> List[str]:
+    all_top_taxa: set[str] = set()
+    for df in df_list:
+        if df.empty:
+            continue
+        df_pivot_rel = calculate_relative_abundance_matrix(df, category)
+        df_temp = df_pivot_rel.drop(index="Unclassified_Taxa", errors="ignore")
+        taxa_totals = df_temp.sum(axis=1)
+        top_taxa = taxa_totals.sort_values(ascending=False).head(top_n).index
+        all_top_taxa.update(top_taxa)
+    return list(all_top_taxa)
+
+
+def create_global_color_map(
+    df_list: List[pd.DataFrame],
+    category: str,
+    top_n: int,
+    palette,
+    fixed_map: Dict[str, str],
+    borrelia_color: str | None = None,
+) -> Dict[str, str]:
+    global_taxa = get_all_top_taxa(df_list, category, top_n)
+    global_color_map: Dict[str, str] = {}
+    taxa_to_remove: List[str] = []
+
+    for substr, color_hex in fixed_map.items():
+        for full_name in global_taxa:
+            if substr.lower() in full_name.lower() and full_name not in global_color_map:
+                global_color_map[full_name] = color_hex
+                taxa_to_remove.append(full_name)
+
+    if borrelia_color:
+        for full_name in global_taxa:
+            if ("Borrelia" in full_name or "Borreliella" in full_name) and full_name not in global_color_map:
+                global_color_map[full_name] = borrelia_color
+                taxa_to_remove.append(full_name)
+
+    remaining_taxa = [t for t in global_taxa if t not in set(taxa_to_remove)]
+
+    fixed_colors_used = set(fixed_map.values())
+    if borrelia_color:
+        fixed_colors_used.add(borrelia_color)
+
+    available_palette = [c for c in palette if c not in fixed_colors_used]
+    palette_cycle = cycle(available_palette)
+
+    for taxon in remaining_taxa:
+        global_color_map[taxon] = next(palette_cycle)
+
+    global_color_map["Other/Unclassified"] = OTHER_COLOR
+    return global_color_map
+
+
+def create_individual_plots(
+    df_all: pd.DataFrame,
+    category: str,
+    output_dir: str,
+    global_color_map: Dict[str, str],
+    sample_to_group: Dict[str, str],
+    ordered_treatments: List[str],
+    top_n: int = 10,
+) -> None:
+    df_pivot_rel = calculate_relative_abundance_matrix(df_all, category)
+    df_top = prepare_top_taxa_data(df_pivot_rel, top_n=top_n)
+
+    all_samples = list(df_pivot_rel.columns)
+
+    def sort_key(sample_name: str) -> Tuple[int, int]:
+        treatment = sample_to_group.get(sample_name, "Unknown")
+        try:
+            treatment_index = ordered_treatments.index(treatment)
+        except ValueError:
+            treatment_index = len(ordered_treatments)
+
+        try:
+            sample_part = sample_name.split("_")[-1]
+            num_str = "".join(filter(str.isdigit, sample_part))
+            num = int(num_str) if num_str else 999
+        except Exception:
+            num = 999
+
+        return (treatment_index, num)
+
+    sample_order = sorted(all_samples, key=sort_key)
+    df_plot = df_top.T.loc[sample_order]
+
+    taxa_order = list(df_plot.columns)
+    if "Other/Unclassified" in taxa_order:
+        taxa_order.remove("Other/Unclassified")
+        taxa_order.append("Other/Unclassified")
+    df_plot = df_plot[taxa_order]
+
+    fig, ax = plt.subplots(figsize=(24, 12))
+    colors = [global_color_map.get(t, "#c7c7c7") for t in df_plot.columns]
+    df_plot.plot(kind="bar", stacked=True, width=1.0, ax=ax, color=colors)
+
+    ax.set_xticklabels([s.split("_")[-1] for s in sample_order], rotation=45, ha="right")
+    ax.set_ylabel("Relative abundance", fontsize=14)
+    ax.set_xlabel("")
+
+    label_category = "genera" if category.lower() == "genere" else "species"
+    ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize="small", title=label_category)
+    ax.set_title(f"Relative abundance of top {top_n} {label_category} per sample", fontsize=16)
+
+    current_group = None
+    group_labels: List[str] = []
+    group_positions: List[float] = []
+
+    for i, sample in enumerate(sample_order):
+        treatment = sample_to_group.get(sample, "Unknown")
+        if treatment != current_group:
+            if i > 0:
+                ax.axvline(x=i - 0.5, color="black", linestyle="--", linewidth=2)
+            group_labels.append(treatment)
+            group_positions.append(i - 0.5)
+            current_group = treatment
+
+    group_positions.append(len(sample_order) - 0.5)
+    for j, label in enumerate(group_labels):
+        start = group_positions[j]
+        end = group_positions[j + 1]
+        center = (start + end) / 2
+        ax.text(
+            center,
+            -0.25,
+            label,
+            ha="center",
+            va="top",
+            transform=ax.get_xaxis_transform(),
+            fontsize=12,
+            fontweight="bold",
+            bbox=dict(facecolor="lightgray", alpha=0.5, edgecolor="none", boxstyle="round,pad=0.5"),
+        )
+
+    plt.tight_layout(rect=[0, 0.1, 1, 1])
+    out = os.path.join(output_dir, f"stacked_barplot_individual_{category}.png")
+    plt.savefig(out, bbox_inches="tight", dpi=300)
+    plt.close()
+
+
+def create_mean_plots(
+    df_all: pd.DataFrame,
+    category: str,
+    output_dir: str,
+    global_color_map: Dict[str, str],
+    sample_to_group: Dict[str, str],
+    ordered_treatments: List[str],
+    top_n: int = 10,
+) -> None:
+    df_pivot_rel = calculate_relative_abundance_matrix(df_all, category)
+    df_pivot_rel_t = df_pivot_rel.T
+    df_pivot_rel_t["treatment"] = df_pivot_rel_t.index.map(sample_to_group)
+
+    df_mean = df_pivot_rel_t.groupby("treatment").mean()
+    df_taxa_pivot = df_mean.T
+    df_top_mean = prepare_top_taxa_data(df_taxa_pivot, top_n=top_n)
+
+    top_taxa = df_top_mean.index.drop("Other/Unclassified").tolist()
+    df_plot = df_mean[top_taxa].copy()
+    df_plot["Other/Unclassified"] = df_top_mean.loc["Other/Unclassified"]
+    df_plot = df_plot.fillna(0)
+
+    treatment_order = [t for t in ordered_treatments if t in df_plot.index]
+    df_plot = df_plot.loc[treatment_order]
+
+    taxa_order = list(df_plot.columns)
+    if "Other/Unclassified" in taxa_order:
+        taxa_order.remove("Other/Unclassified")
+        taxa_order.append("Other/Unclassified")
+    df_plot = df_plot[taxa_order]
+
+    fig, ax = plt.subplots(figsize=(12, 8))
+    colors = [global_color_map.get(t, "#c7c7c7") for t in df_plot.columns]
+    df_plot.plot(kind="bar", stacked=True, width=0.8, ax=ax, color=colors)
+
+    ax.set_xticklabels(df_plot.index, rotation=45, ha="right")
+    ax.set_ylabel("Mean relative abundance", fontsize=14)
+    ax.set_xlabel("Treatment group", fontsize=14)
+
+    label_category = "genera" if category.lower() == "genere" else "species"
+    ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize="small", title=label_category)
+    ax.set_title(f"Mean relative abundance of top {top_n} {label_category} per treatment", fontsize=16)
+
+    plt.tight_layout()
+    out = os.path.join(output_dir, f"stacked_barplot_mean_{category}.png")
+    plt.savefig(out, bbox_inches="tight", dpi=300)
+    plt.close()
+
+
+def process_abundance_analysis_initial(
+    folder_list: List[str],
+    group_label: str,
+    folder_name_mapping: Dict[str, str],
+) -> Tuple[pd.DataFrame, Dict[str, str]]:
+    print(f"\n--- Loading abundance tables: {group_label} ---")
+    all_data: List[pd.DataFrame] = []
+
+    for folder in folder_list:
+        if not os.path.isdir(folder):
+            continue
+
+        folder_name_full = os.path.basename(folder.rstrip("/"))
+        treatment = folder_name_mapping.get(folder_name_full, folder_name_full)
+
+        for filename in os.listdir(folder):
+            if not filename.endswith("_subsampled_taxa.txt"):
+                continue
+
+            filepath = os.path.join(folder, filename)
+            sample_base = os.path.splitext(filename)[0].replace("_subsampled_taxa", "")
+            sample_name_unique = f"{treatment}_{sample_base}"
+
+            try:
+                df = pd.read_csv(filepath, sep="\t", header=None, names=["taxonomy", "count", "read_ids"])
+                df["count"] = pd.to_numeric(df["count"], errors="coerce").fillna(0)
+
+                taxonomy_parts = df["taxonomy"].astype(str).str.split(";")
+
+                df["genere"] = taxonomy_parts.apply(
+                    lambda x: x[5].strip() if len(x) >= 6 and x[5].strip() not in ("g__", "") else "Unclassified_Taxa"
+                )
+
+                def get_species(parts: List[str]) -> str:
+                    if len(parts) >= 7 and parts[6].strip() not in ("s__", "s__uncultured", "s__metagenome", ""):
+                        return parts[6].strip()
+                    return "Unclassified_Taxa"
+
+                df["specie"] = taxonomy_parts.apply(get_species)
+
+                df["sample"] = sample_name_unique
+                df["treatment"] = treatment
+                all_data.append(df)
+
+            except Exception as e:
+                print(f"[WARN] Failed to parse {filepath}: {e}")
+
+    if not all_data:
+        print(f"[WARN] No valid abundance data found for {group_label}.")
+        return pd.DataFrame(), {}
+
+    df_all = pd.concat(all_data, ignore_index=True)
+    sample_to_group = (
+        df_all[["sample", "treatment"]].drop_duplicates().set_index("sample")["treatment"].to_dict()
+    )
+
+    print(f"Loaded {len(sample_to_group)} samples for {group_label}.")
+    return df_all, sample_to_group
+
+
+def process_plotting(
+    df_all: pd.DataFrame,
+    group_label: str,
+    output_dir: str,
+    global_color_map_genere: Dict[str, str],
+    global_color_map_specie: Dict[str, str],
+    sample_to_group: Dict[str, str],
+    ordered_treatments: List[str],
+    top_n: int,
+) -> None:
+    if df_all.empty:
+        return
+
+    print(f"\n--- Generating abundance plots: {group_label} ---")
+    create_individual_plots(df_all, "genere", output_dir, global_color_map_genere, sample_to_group, ordered_treatments, top_n=top_n)
+    create_individual_plots(df_all, "specie", output_dir, global_color_map_specie, sample_to_group, ordered_treatments, top_n=top_n)
+    create_mean_plots(df_all, "genere", output_dir, global_color_map_genere, sample_to_group, ordered_treatments, top_n=top_n)
+    create_mean_plots(df_all, "specie", output_dir, global_color_map_specie, sample_to_group, ordered_treatments, top_n=top_n)
+
+
+# -----------------------------
+# Diversity helpers (alpha/beta)
+# -----------------------------
+
+def shannon(counts: np.ndarray) -> float:
+    counts = counts[counts > 0]
+    total = np.sum(counts)
+    if total == 0:
+        return 0.0
+    p = counts / total
+    return float(-np.sum(p * np.log(p)))
+
+
+def simpson(counts: np.ndarray) -> float:
+    counts = counts[counts > 0]
+    total = np.sum(counts)
+    if total == 0:
+        return 0.0
+    p = counts / total
+    return float(np.sum(p ** 2))
+
+
+def draw_ellipse(x: np.ndarray, y: np.ndarray, ax, color: str, confidence_level: float = 0.95, linewidth: int = 1) -> None:
+    if len(x) < 2:
+        return
+    try:
+        cov = np.cov(x, y)
+        eigvals, eigvecs = np.linalg.eig(cov)
+        eigvals[eigvals <= 1e-10] = 1e-10
+        axes = np.sqrt(eigvals)
+        scale = chi2.ppf(confidence_level, 2)
+
+        angle = np.degrees(np.arccos(eigvecs[0, 0]))
+        ell = Ellipse(
+            xy=(np.mean(x), np.mean(y)),
+            width=axes[0] * 2 * np.sqrt(scale),
+            height=axes[1] * 2 * np.sqrt(scale),
+            angle=angle,
+            edgecolor=color,
+            fill=False,
+            linewidth=linewidth,
+        )
+        ax.add_artist(ell)
+    except Exception:
+        return
+
+
+def pcoa_manual(dist_matrix: np.ndarray, index_names: List[str]) -> Tuple[pd.DataFrame, np.ndarray]:
+    D = squareform(dist_matrix)
+    n = D.shape[0]
+    D2 = D ** 2
+    J = np.eye(n) - np.ones((n, n)) / n
+    B = -0.5 * J.dot(D2).dot(J)
+
+    eigvals, eigvecs = eigh(B)
+    idx = eigvals.argsort()[::-1]
+    eigvals = eigvals[idx]
+    eigvecs = eigvecs[:, idx]
+
+    positive = eigvals[eigvals > 1e-6]
+    num_dims = min(2, len(positive))
+    if num_dims == 0:
+        return pd.DataFrame(index=index_names), eigvals
+
+    coords = eigvecs[:, :num_dims] @ np.sqrt(np.diag(positive[:num_dims]))
+    coords_df = pd.DataFrame(coords, index=index_names)
+    coords_df.columns = ["PC1", "PC2"] if num_dims == 2 else ["PC1"]
+    return coords_df, eigvals
+
+
+def permanova_test(dist_matrix: np.ndarray, groups: np.ndarray, permutations: int = 999) -> Tuple[float, float, int]:
+    if len(np.unique(groups)) <= 1:
+        return np.nan, np.nan, permutations
+
+    D2 = squareform(dist_matrix) ** 2
+    n = D2.shape[0]
+    SST = np.sum(D2) / (2 * n)
+
+    groups_unique = np.unique(groups)
+    SSW = 0.0
+    for g in groups_unique:
+        idx = np.where(groups == g)[0]
+        n_g = len(idx)
+        if n_g < 2:
+            continue
+        Dg = D2[idx[:, None], idx]
+        SSW += np.sum(Dg) / (2 * n_g)
+
+    SSA = SST - SSW
+    df_A = len(groups_unique) - 1
+    df_W = n - len(groups_unique)
+    if df_W <= 0:
+        return np.nan, np.nan, permutations
+
+    MSA = SSA / df_A
+    MSW = SSW / df_W
+    F_obs = MSA / MSW if MSW > 1e-9 else np.nan
+    if np.isnan(F_obs):
+        return np.nan, np.nan, permutations
+
+    F_perm = []
+    for _ in range(permutations):
+        perm = np.random.permutation(groups)
+        SSW_p = 0.0
+        for g in groups_unique:
+            idx = np.where(perm == g)[0]
+            n_g = len(idx)
+            if n_g < 2:
+                continue
+            Dg = D2[idx[:, None], idx]
+            SSW_p += np.sum(Dg) / (2 * n_g)
+        SSA_p = SST - SSW_p
+        MSA_p = SSA_p / df_A
+        MSW_p = SSW_p / df_W
+        F_perm.append(MSA_p / MSW_p if MSW_p > 1e-9 else 0.0)
+
+    F_perm = np.asarray(F_perm)
+    p_value = (np.sum(F_perm >= F_obs) + 1) / (permutations + 1)
+    return float(F_obs), float(p_value), permutations
+
+
+# -----------------------------
+# Post-hoc helpers (uncorrected)
+# -----------------------------
+
+def pairwise_wilcoxon_uncorrected(alpha_df: pd.DataFrame, metric: str) -> pd.DataFrame:
+    groups = alpha_df["group"].unique()
+    out = []
+    for g1, g2 in combinations(groups, 2):
+        d1 = alpha_df.loc[alpha_df["group"] == g1, metric].dropna().values
+        d2 = alpha_df.loc[alpha_df["group"] == g2, metric].dropna().values
+
+        if len(d1) < 2 or len(d2) < 2:
+            stat, p = np.nan, np.nan
+        else:
+            try:
+                stat, p = ranksums(d1, d2)
+            except Exception:
+                stat, p = np.nan, np.nan
+
+        out.append(
+            {
+                "Comparison": f"{g1} vs {g2}",
+                "W_Stat": stat,
+                "P_Value": p,
+                "Significant": (p < 0.05) if not np.isnan(p) else False,
+            }
+        )
+    return pd.DataFrame(out)
+
+
+def pairwise_permanova_uncorrected(dist_matrix: np.ndarray, groups: np.ndarray) -> pd.DataFrame:
+    groups_unique = np.unique(groups)
+    out = []
+    D = squareform(dist_matrix)
+
+    for g1, g2 in combinations(groups_unique, 2):
+        idx1 = np.where(groups == g1)[0]
+        idx2 = np.where(groups == g2)[0]
+
+        if len(idx1) < 2 or len(idx2) < 2:
+            F_stat, p = np.nan, np.nan
+        else:
+            combined = np.concatenate([idx1, idx2])
+            D_sub = D[combined[:, None], combined]
+            dist_sub = squareform(D_sub)
+            groups_sub = groups[combined]
+            F_stat, p, _ = permanova_test(dist_sub, groups_sub, permutations=499)
+
+        out.append(
+            {
+                "Comparison": f"{g1} vs {g2}",
+                "F_Stat": F_stat,
+                "P_Value": p,
+                "Significant": (p < 0.05) if not np.isnan(p) else False,
+            }
+        )
+    return pd.DataFrame(out)
+
+
+def create_summary_report(all_posthoc_results: Dict[str, pd.DataFrame], group_label: str, output_dir: str) -> None:
+    report_path = os.path.join(output_dir, f"stat_report_significant_summary_{group_label.lower()}.txt")
+
+    all_p = []
+    for df in all_posthoc_results.values():
+        all_p.extend(df["P_Value"].dropna().astype(float).values)
+
+    if len(all_p) == 0:
+        with open(report_path, "w") as f:
+            f.write("No statistically significant differences (P < 0.05) detected in post-hoc tests.\n")
+        print(f"[OK] Significant summary report saved: {report_path}")
+        return
+
+    rejected, p_corr, _, _ = multipletests(all_p, alpha=0.05, method="fdr_bh")
+
+    idx = 0
+    for df in all_posthoc_results.values():
+        for i in range(len(df)):
+            pval = df.iloc[i]["P_Value"]
+            if pd.isna(pval):
+                continue
+            df.at[df.index[i], "P_Value_Corrected"] = p_corr[idx]
+            df.at[df.index[i], "Significant_FDR"] = p_corr[idx] < 0.05
+            idx += 1
+
+    with open(report_path, "w") as f:
+        f.write("==========================================================\n")
+        f.write("SIGNIFICANT RESULTS (FDR-corrected P < 0.05)\n")
+        f.write(f"Group: {group_label}\n")
+        f.write("==========================================================\n\n")
+
+        found = False
+        for test_name, df in all_posthoc_results.items():
+            sig = df[df.get("Significant_FDR", False)].copy()
+            if sig.empty:
+                continue
+            found = True
+            f.write(f"--- Test: {test_name.replace('_', ' ').upper()} ---\n")
+            for _, row in sig.iterrows():
+                p = float(row["P_Value_Corrected"])
+                stars = "***" if p < 0.001 else ("**" if p < 0.01 else ("*" if p < 0.05 else ""))
+                f.write(f"{row['Comparison']}: p={p:.3g} {stars}\n")
+            f.write("\n")
+
+        if not found:
+            f.write("No statistically significant differences (FDR-corrected P < 0.05).\n")
+
+    print(f"[OK] Significant summary report saved: {report_path}")
+
+
+# -----------------------------
+# Diversity main
+# -----------------------------
+
+def analyze_diversity(input_file: str, output_dir: str, group_label: str) -> None:
+    print(f"\n=== Diversity analysis: {group_label} ===")
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    plt.rcParams.update(
+        {
+            "axes.titlesize": 20,
+            "axes.labelsize": 16,
+            "xtick.labelsize": 15,
+            "ytick.labelsize": 15,
+            "legend.fontsize": 15,
+            "legend.title_fontsize": 16,
+        }
+    )
+
+    try:
+        table = pd.read_csv(input_file, index_col=0)
+    except FileNotFoundError:
+        print(f"[WARN] File not found: {input_file}. Skipping {group_label}.")
+        return
+
+    df_final = table.copy()
+    if df_final.empty:
+        print(f"[WARN] Empty table for {group_label}.")
+        return
+
+    df_final = df_final.loc[:, (df_final != 0).any(axis=0)]
+
+    def extract_treatment(sample_name: str) -> str:
+        parts = sample_name.lower().split("_")
+        if "lyzo" in parts and "zap" in parts:
+            return "lyzo_zap"
+        if "lyzo" in parts and ("cand" in parts or "candeggina" in parts):
+            return "lyzo_cand"
+        if "etanolo" in parts:
+            return "etanolo"
+        if "controllo" in parts:
+            return "controllo"
+        if "zap" in parts:
+            return "zap"
+        if "candeggina" in parts or "cand" in parts:
+            if "vecchia" in parts:
+                return "Old_Bleach"
+            return "candeggina"
+        return "unknown"
+
+    group_keys_raw = df_final.index.to_series().apply(extract_treatment)
+    sample_to_group = group_keys_raw.apply(lambda x: SHORT_TREATMENT_MAPPING.get(x, x))
+    groups = sample_to_group.values
+    unique_groups = np.unique(groups)
+
+    if len(unique_groups) < 2:
+        print("[WARN] Fewer than 2 unique groups. Skipping statistics/plots.")
+        return
+
+    results = []
+    all_posthoc_results: Dict[str, pd.DataFrame] = {}
+
+    # Alpha diversity (Shannon, Simpson) + Kruskal-Wallis + per-metric boxplots
+    print("\n--- Alpha diversity (Shannon, Simpson) ---")
+    alpha_df = pd.DataFrame(index=df_final.index)
+    alpha_df["shannon"] = df_final.apply(shannon, axis=1)
+    alpha_df["simpson"] = df_final.apply(simpson, axis=1)
+    alpha_df["group"] = sample_to_group
+
+    for metric in ["shannon", "simpson"]:
+        group_data = [alpha_df.loc[alpha_df["group"] == g, metric].dropna().values for g in unique_groups]
+        valid_data = [d for d in group_data if len(d) >= 2]
+
+        H_stat, p_value = np.nan, np.nan
+        if len(valid_data) >= 2:
+            try:
+                H_stat, p_value = kruskal(*valid_data)
+            except Exception as e:
+                print(f"[WARN] Kruskal-Wallis failed for {metric}: {e}")
+
+        is_sig = (not np.isnan(p_value)) and (p_value < 0.05)
+
+        results.append(
+            {
+                "Metric": f"Alpha ({metric.title()})",
+                "Test": "Kruskal-Wallis H",
+                "Statistic": f"{H_stat:.3f}" if not np.isnan(H_stat) else "NA",
+                "P-value": f"{p_value:.5f}" if not np.isnan(p_value) else "NA",
+                "Significant": "YES" if is_sig else ("NO" if not np.isnan(p_value) else "NA"),
+            }
+        )
+
+        if is_sig:
+            ph = pairwise_wilcoxon_uncorrected(alpha_df, metric)
+            all_posthoc_results[f"Alpha_{metric}_PostHoc"] = ph
+
+        # Single alpha plot per metric (no combined plots)
+        plt.figure(figsize=(10, 7))
+        plot_order = [t for t in ORDERED_TREATMENTS if t in alpha_df["group"].unique()]
+        sns.boxplot(
+            x="group",
+            y=metric,
+            data=alpha_df,
+            order=plot_order,
+            palette={t: TREATMENT_PALETTE[t] for t in plot_order if t in TREATMENT_PALETTE},
+        )
+        sns.stripplot(
+            x="group",
+            y=metric,
+            data=alpha_df,
+            order=plot_order,
+            color=".25",
+            jitter=True,
+            size=5,
+        )
+        p_text = f"P={p_value:.3f}" if not np.isnan(p_value) else "P=NA"
+        plt.title(f"{metric.title()} diversity\nKruskal-Wallis {p_text}", fontsize=16)
+        plt.xlabel("Group", fontsize=12)
+        plt.ylabel(f"{metric.title()} index", fontsize=12)
+        plt.xticks(rotation=45, ha="right")
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, f"boxplot_{metric}_{group_label.lower()}.png"), dpi=300)
+        plt.close()
+
+    # Beta diversity (Bray-Curtis, Jaccard) + PERMANOVA + PCoA (one plot per metric)
+    print("\n--- Beta diversity (PCoA + PERMANOVA) ---")
+    dist_bray = pdist(df_final, metric="braycurtis")
+    dist_jacc = pdist(df_final, metric="jaccard")
+    beta_metrics = {"Bray-Curtis": dist_bray, "Jaccard": dist_jacc}
+
+    for metric_name, dist_matrix in beta_metrics.items():
+        F_stat, p_value, n_perm = permanova_test(dist_matrix, groups, permutations=999)
+        is_sig = (not np.isnan(p_value)) and (p_value < 0.05)
+
+        results.append(
+            {
+                "Metric": f"Beta ({metric_name})",
+                "Test": f"PERMANOVA ({n_perm} perm.)",
+                "Statistic": f"{F_stat:.3f}" if not np.isnan(F_stat) else "NA",
+                "P-value": f"{p_value:.5f}" if not np.isnan(p_value) else "NA",
+                "Significant": "YES" if is_sig else ("NO" if not np.isnan(p_value) else "NA"),
+            }
+        )
+
+        if is_sig:
+            ph = pairwise_permanova_uncorrected(dist_matrix, groups)
+            all_posthoc_results[f"Beta_{metric_name}_PostHoc"] = ph
+
+        df_pcoa, eigvals = pcoa_manual(dist_matrix, df_final.index.tolist())
+        if "PC2" not in df_pcoa.columns:
+            continue
+
+        df_pcoa["group"] = sample_to_group.values
+        plot_order = [t for t in ORDERED_TREATMENTS if t in df_pcoa["group"].unique()]
+        palette_ordered = {t: TREATMENT_PALETTE[t] for t in plot_order if t in TREATMENT_PALETTE}
+
+        fig, ax = plt.subplots(figsize=(10, 8))
+        sns.scatterplot(
+            x="PC1",
+            y="PC2",
+            hue="group",
+            style="group",
+            hue_order=plot_order,
+            style_order=plot_order,
+            data=df_pcoa,
+            s=100,
+            palette=palette_ordered,
+            ax=ax,
+        )
+
+        total_eig = np.sum(eigvals[eigvals > 1e-6])
+        pc1_var = eigvals[0] / total_eig if total_eig > 0 else 0
+        pc2_var = eigvals[1] / total_eig if total_eig > 0 else 0
+
+        ax.set_xlabel(f"PCo1 ({pc1_var:.2%})")
+        ax.set_ylabel(f"PCo2 ({pc2_var:.2%})")
+        title_stat = f"PERMANOVA F={F_stat:.3f}, P={p_value:.3f}" if not np.isnan(F_stat) else "PERMANOVA: NA"
+        ax.set_title(f"PCoA ({metric_name})\n{title_stat}")
+        ax.legend(title="Groups", bbox_to_anchor=(1.05, 1), loc="upper left")
+
+        plt.tight_layout()
+        out = os.path.join(output_dir, f"pcoa_{metric_name.replace('-', '_')}_{group_label.lower()}.png")
+        plt.savefig(out, dpi=300)
+        plt.close()
+
+    # Save summaries
+    results_df = pd.DataFrame(results)
+    out_global = os.path.join(output_dir, f"stat_summary_global_{group_label.lower()}.csv")
+    results_df.to_csv(out_global, index=False)
+    print(f"[OK] Global stats saved: {out_global}")
+
+    if all_posthoc_results:
+        for test_name, df in all_posthoc_results.items():
+            out_ph = os.path.join(output_dir, f"stat_summary_{test_name.lower()}_uncorrected.csv")
+            df.to_csv(out_ph, index=False)
+        create_summary_report(all_posthoc_results, group_label, output_dir)
+
+
+# -----------------------------
+# CLI + entrypoint
+# -----------------------------
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Abundance + diversity plots/stats for Nanopore full-length 16S pipeline."
+    )
+
+    p.add_argument("--adult-folders", nargs="+", required=True, help="List of adult treatment directories.")
+    p.add_argument("--nymph-folders", nargs="+", required=True, help="List of nymph treatment directories.")
+    p.add_argument("--adult-diversity-csv", required=True, help="Adult diversity input CSV (rows=samples, cols=counts).")
+    p.add_argument("--nymph-diversity-csv", required=True, help="Nymph diversity input CSV (rows=samples, cols=counts).")
+    p.add_argument("--outdir", required=True, help="Base output directory.")
+    p.add_argument("--top-n", type=int, default=10, help="Top N taxa for stacked barplots (default: 10).")
+
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    out_abund_adults = os.path.join(args.outdir, "abundance_plots_adults_subsampled")
+    out_abund_nymphs = os.path.join(args.outdir, "abundance_plots_nymphs_subsampled")
+    out_div_adults = os.path.join(args.outdir, "diversity_plots_adults_subsampled")
+    out_div_nymphs = os.path.join(args.outdir, "diversity_plots_nymphs_subsampled")
+
+    for d in [out_abund_adults, out_abund_nymphs, out_div_adults, out_div_nymphs]:
+        os.makedirs(d, exist_ok=True)
+
+    # Abundance
+    df_adults, map_adults = process_abundance_analysis_initial(args.adult_folders, "Adults", FULL_FOLDER_NAME_MAPPING)
+    df_nymphs, map_nymphs = process_abundance_analysis_initial(args.nymph_folders, "Nymphs", FULL_FOLDER_NAME_MAPPING)
+
+    global_color_map_genus = create_global_color_map(
+        df_list=[df_adults, df_nymphs],
+        category="genere",
+        top_n=args.top_n,
+        palette=DEFAULT_PALETTE,
+        fixed_map=FIXED_COLOR_MAP_GENUS,
+        borrelia_color=None,
+    )
+
+    global_color_map_species = create_global_color_map(
+        df_list=[df_adults, df_nymphs],
+        category="specie",
+        top_n=args.top_n,
+        palette=DEFAULT_PALETTE,
+        fixed_map={},
+        borrelia_color=None,
+    )
+
+    process_plotting(
+        df_adults,
+        "Adults",
+        out_abund_adults,
+        global_color_map_genus,
+        global_color_map_species,
+        map_adults,
+        ORDERED_TREATMENTS,
+        top_n=args.top_n,
+    )
+
+    process_plotting(
+        df_nymphs,
+        "Nymphs",
+        out_abund_nymphs,
+        global_color_map_genus,
+        global_color_map_species,
+        map_nymphs,
+        ORDERED_TREATMENTS,
+        top_n=args.top_n,
+    )
+
+    # Diversity
+    analyze_diversity(args.adult_diversity_csv, out_div_adults, "Adults")
+    analyze_diversity(args.nymph_diversity_csv, out_div_nymphs, "Nymphs")
+
+    print("\n[OK] Pipeline completed.")
+
+
+if __name__ == "__main__":
+    main()
