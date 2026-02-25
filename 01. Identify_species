@@ -1,32 +1,45 @@
 #!/usr/bin/env python3
 import re
 from collections import defaultdict
-import glob
 import os
+import argparse
 
 # ----------------------------
-# Helper function: compute alignment length from CIGAR
+# Funzioni helper
 # ----------------------------
-def calc_alignment_length(cigar):
-    return sum(int(length) for length, op in re.findall(r'(\d+)([MD=X])', cigar))
+_CIGAR_RE = re.compile(r'(\d+)([MIDNSHP=X])')
+
+def calcola_lunghezza_allineamento_ref(cigar: str) -> int:
+    """
+    Lunghezza dell'allineamento sul riferimento:
+      M + D + = + X
+    """
+    ops = _CIGAR_RE.findall(cigar)
+    return sum(int(n) for n, op in ops if op in ('M', 'D', '=', 'X'))
+
+def estrai_AS(fields):
+    for x in fields:
+        if x.startswith('AS:i:'):
+            try:
+                return int(x[5:])
+            except ValueError:
+                return None
+    return None
 
 # ----------------------------
-# Main SAM processing function
+# Funzione principale
 # ----------------------------
-def process_sam(input_file, output_file, min_len=1300, max_len=1700):
-    best_hit_per_read = {}
-    unaligned_reads = 0
-    full_length_count = 0
-    ref_counts = defaultdict(int)
-    discarded_lengths = []
-    discarded_ids = []
+def processa_sam(file_in, file_out, min_len=1300, max_len=1700):
 
-    with open(input_file, 'r', encoding='utf-8') as f_in:
+    best_hit_per_read = {}  # read_id -> (AS, lunghezza_ref, ref_id)
+    reads_cigar_zero = 0
+
+    with open(file_in, 'r', encoding='utf-8') as f_in:
         for line in f_in:
             if line.startswith('@'):
                 continue
 
-            fields = line.strip().split('\t')
+            fields = line.rstrip('\n').split('\t')
             if len(fields) < 11:
                 continue
 
@@ -35,47 +48,84 @@ def process_sam(input_file, output_file, min_len=1300, max_len=1700):
             ref_id = fields[2]
 
             if cigar == '*':
-                unaligned_reads += 1
+                reads_cigar_zero += 1
                 continue
 
-            AS_values = [int(x[5:]) for x in fields if x.startswith('AS:i:')]
-            if not AS_values:
+            AS = estrai_AS(fields)
+            if AS is None:
                 continue
-            AS = AS_values[0]
 
-            aln_len = calc_alignment_length(cigar)
+            lunghezza_ref = calcola_lunghezza_allineamento_ref(cigar)
 
+            # Tieni solo best AS
             if read_id not in best_hit_per_read or AS > best_hit_per_read[read_id][0]:
-                best_hit_per_read[read_id] = (AS, aln_len, ref_id)
+                best_hit_per_read[read_id] = (AS, lunghezza_ref, ref_id)
 
-    with open(output_file, 'w', encoding='utf-8') as f_out:
-        for read_id, (AS, aln_len, ref_id) in best_hit_per_read.items():
-            if min_len <= aln_len <= max_len:
-                full_length_count += 1
-                ref_counts[ref_id] += 1
-            else:
-                discarded_lengths.append(aln_len)
-                if len(discarded_ids) < 2:
-                    discarded_ids.append(read_id)
+    total_reads = len(best_hit_per_read)
+    kept_reads = 0
+    lost_reads = 0
+    id_count = defaultdict(int)
+    reads_scartate_ids = []
 
-        for ref_id, count in ref_counts.items():
+    # Filtro lunghezza full-length
+    for read_id, (AS, lunghezza_ref, ref_id) in best_hit_per_read.items():
+        if min_len <= lunghezza_ref <= max_len:
+            kept_reads += 1
+            id_count[ref_id] += 1
+        else:
+            lost_reads += 1
+            if len(reads_scartate_ids) < 2:
+                reads_scartate_ids.append(read_id)
+
+    # Scrivi output
+    with open(file_out, 'w', encoding='utf-8') as f_out:
+        for ref_id, count in id_count.items():
             f_out.write(f"{ref_id}\t{count}\n")
 
-    sample_name = os.path.basename(input_file)
-    print(f"Sample: {sample_name} → Full-length reads: {full_length_count}")
-    print(f"Unaligned reads (CIGAR='*'): {unaligned_reads}")
-    if discarded_ids:
-        print(f"First 2 discarded reads: {', '.join(discarded_ids)}")
-    print("-" * 60)
+    sample_name = os.path.basename(file_in)
+
+    print(f"📊 Campione: {sample_name}")
+    print(f"   Reads con almeno un allineamento: {total_reads}")
+    print(f"   Reads conservate (best-hit full-length): {kept_reads}")
+    print(f"   Reads perse per lunghezza: {lost_reads} "
+          f"({(lost_reads/total_reads*100 if total_reads else 0):.2f}%)")
+    print(f"   Reads non allineate (CIGAR='*'): {reads_cigar_zero}")
+
+    if reads_scartate_ids:
+        print(f"   🗑️ Prime 2 reads scartate: {', '.join(reads_scartate_ids)}")
+
+    print("-" * 70)
 
 # ----------------------------
-# Run on all SAM files in folder
+# MAIN ricorsivo
 # ----------------------------
-sam_folder = "path/to/sam_folder"
+parser = argparse.ArgumentParser(
+    description="Best hit (AS massimo) per read su tutti i SAM filtrati (ricorsivo)"
+)
+parser.add_argument("input_dir", help="Directory radice")
+parser.add_argument("--pattern", default="_filtered.sam",
+                    help="Suffisso dei file SAM filtrati (default: _filtered.sam)")
+parser.add_argument("--min_len", type=int, default=1300)
+parser.add_argument("--max_len", type=int, default=1700)
+args = parser.parse_args()
 
-for input_file in glob.glob(os.path.join(sam_folder, "*.sam")):
-    filename = os.path.basename(input_file)
-    number, ext = os.path.splitext(filename)
-    if number.isdigit() and 27 <= int(number) <= 43:
-        output_file = os.path.splitext(input_file)[0] + ".txt"
-        process_sam(input_file, output_file)
+root = args.input_dir
+
+if not os.path.isdir(root):
+    print(f"Errore: '{root}' non è una directory.")
+    raise SystemExit(1)
+
+found_any = False
+
+for dirpath, dirnames, filenames in os.walk(root):
+    for fn in filenames:
+        if fn.endswith(args.pattern):
+            found_any = True
+            input_file = os.path.join(dirpath, fn)
+            output_file = os.path.splitext(input_file)[0] + ".txt"
+            processa_sam(input_file, output_file,
+                         min_len=args.min_len,
+                         max_len=args.max_len)
+
+if not found_any:
+    print(f"Nessun file con suffisso '{args.pattern}' trovato sotto {root}")
