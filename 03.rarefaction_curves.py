@@ -2,260 +2,290 @@
 import os
 import re
 import glob
+import argparse
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-try:
-    import seaborn as sns
-except ImportError:
-    sns = None
-    print("⚠️ seaborn not found. KDE plots will use matplotlib.")
+# ================================================================
+# File discovery + naming
+# ================================================================
+def find_taxonomy_files(root_dir: str, suffix: str, recursive: bool = True):
+    pattern = os.path.join(root_dir, "**", f"*{suffix}") if recursive else os.path.join(root_dir, f"*{suffix}")
+    files = glob.glob(pattern, recursive=recursive)
+    files = [f for f in files if os.path.isfile(f)]
+    return sorted(files)
 
-# ----------------------------
-# GENERIC PATHS
-# ----------------------------
-ADULT_FOLDERS = [
-    "path/to/adults_control",
-    "path/to/adults_ethanol",
-    "path/to/adults_bleach",
-    "path/to/adults_zap",
-    "path/to/adults_lyzo_zap",
-    "path/to/adults_lyzo_bleach",
-]
+def make_unique_sample_name(filepath: str, root_dir: str, suffix: str):
+    """
+    Nome campione unico basato sul path relativo:
+      group/sample_taxonomy.txt -> group__sample
+    """
+    rel = os.path.relpath(filepath, root_dir)
+    base = rel.replace(os.sep, "__")
+    if base.endswith(suffix):
+        base = base[:-len(suffix)]
+    return base
 
-NYMPH_FOLDERS = [
-    "path/to/nymphs_control",
-    "path/to/nymphs_ethanol",
-    "path/to/nymphs_bleach",
-    "path/to/nymphs_zap",
-    "path/to/nymphs_lyzo_zap",
-    "path/to/nymphs_lyzo_bleach",
-]
-
-GROUP_NAME_MAP = {
-    "adults_control": "Adults Control",
-    "adults_ethanol": "Adults Ethanol",
-    "adults_bleach": "Adults Bleach",
-    "adults_zap": "Adults Zap",
-    "adults_lyzo_zap": "Adults Lyzo_Zap",
-    "adults_lyzo_bleach": "Adults Lyzo_Bleach",
-    "nymphs_control": "Nymphs Control",
-    "nymphs_ethanol": "Nymphs Ethanol",
-    "nymphs_bleach": "Nymphs Bleach",
-    "nymphs_zap": "Nymphs Zap",
-    "nymphs_lyzo_zap": "Nymphs Lyzo_Zap",
-    "nymphs_lyzo_bleach": "Nymphs Lyzo_Bleach",
-}
-
-PALETTE_GROUPS = ["#1b9e77","#1f78b4","#e31a1c","#6a3d9a","#8c510a","#ff7f00"]
-
-# ----------------------------
-# TAXONOMY PARSING
-# ----------------------------
-def aggregation_key(taxonomy):
-    parts = taxonomy.split(';')
-    if len(parts) < 7:
-        return None
-    genus = parts[5].lower()
-    species = parts[6].lower()
-    if species in ['uncultured_bacterium','uncultured_organism']:
-        return f"{genus}_{species}"
-    return f"{genus}_{species}" if '_' not in species else species
-
-def parse_taxonomy_file(taxonomy_file):
-    tax_dict = {}
-    with open(taxonomy_file) as f:
+# ================================================================
+# Parsing taxonomy files
+# ================================================================
+def parse_taxonomy_file(filepath: str):
+    """
+    Atteso formato per riga:
+      <full_taxonomy>\t<count>
+    Ritorna dict: {taxonomy_string: count_int}
+    """
+    taxa_counts = {}
+    with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
-            parts = line.strip().split(None,1)
-            if len(parts)==2:
-                tax_dict[parts[0]] = parts[1]
-    return tax_dict
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
 
-def aggregate_counts(input_folder, taxonomy_file):
-    tax_dict = parse_taxonomy_file(taxonomy_file)
+            taxonomy = parts[0].strip()
+            count_str = re.sub(r"[^\d]", "", parts[1].strip())
+            if count_str == "":
+                continue
+            count = int(count_str)
+            if count <= 0:
+                continue
+
+            taxa_counts[taxonomy] = taxa_counts.get(taxonomy, 0) + count
+    return taxa_counts
+
+def build_table(files, root_dir, suffix):
+    """
+    Costruisce tabella campioni x taxa (counts) e mapping sample->group (sottocartella).
+    """
     data = {}
-    counter = {}
-    for folder in input_folder:
-        if not os.path.isdir(folder):
-            print(f"⚠️ Folder not found: {folder}")
-            continue
-        folder_name = os.path.basename(folder)
-        counter[folder_name] = 1
-        for file in sorted(os.listdir(folder)):
-            if file.endswith("taxonomy.txt"):
-                filepath = os.path.join(folder,file)
-                parsed=[]
-                with open(filepath,'r',encoding='utf-8',errors='ignore') as f:
-                    for line in f:
-                        if not line.strip() or line.startswith(("Specie","Tassonomia","taxonomy")):
-                            continue
-                        parts = line.strip().split('\t')
-                        if len(parts)>=2:
-                            tax, count_str = parts[0].strip(), re.sub(r'[^\d]','',parts[1])
-                            try:
-                                parsed.append({'tax':tax,'count':int(count_str)})
-                            except ValueError:
-                                continue
-                df = pd.DataFrame(parsed)
-                if not df.empty:
-                    df_agg = df.groupby('tax',dropna=False)['count'].sum().reset_index().set_index('tax')
-                    sample_name = f"{folder_name}_{counter[folder_name]}"
-                    counter[folder_name]+=1
-                    data[sample_name] = df_agg['count'].to_dict()
-    return pd.DataFrame.from_dict(data,orient='index').fillna(0)
+    sample_to_group = {}
+    for fp in files:
+        sample = make_unique_sample_name(fp, root_dir, suffix)
+        group = os.path.basename(os.path.dirname(fp))  # sottocartella immediata
+        data[sample] = parse_taxonomy_file(fp)
+        sample_to_group[sample] = group
 
-# ----------------------------
-# RAREFACTION & CHAO1
-# ----------------------------
-def rarefaction_curve(abundances,num_points=1000,extend_factor=1.05):
-    abundances=np.array(abundances)
-    total_reads=np.sum(abundances)
-    if total_reads==0:
-        return np.array([0]),np.array([0])
-    p=abundances/total_reads
-    max_reads=int(total_reads*extend_factor)
-    x=np.linspace(1,max_reads,num=num_points)
-    y=np.sum(1-(1-p[:,None])**x,axis=0)
-    return x,y
+    tabella = pd.DataFrame.from_dict(data, orient="index").fillna(0).astype(int)
+    tabella.index.name = "sample"
+    return tabella, sample_to_group
 
-def chao1(abundances):
-    abundances=np.array(abundances)
-    S_obs=np.sum(abundances>0)
-    F1=np.sum(abundances==1)
-    F2=np.sum(abundances==2)
-    return S_obs + (F1*(F1-1)/2 if F2==0 else (F1**2)/(2*F2))
+# ================================================================
+# Rarefaction expectation
+# ================================================================
+def expected_species_at_x(abundances, x):
+    """
+    E[S(x)] = sum_i (1 - (1 - p_i)^x), p_i = abund_i / N.
+    Se x > N (reads osservate), usa x_eff=N (satura a S_obs).
+    """
+    abund = np.asarray(abundances, dtype=float)
+    abund = abund[abund > 0]
+    N = abund.sum()
+    if N <= 0:
+        return 0.0
 
-def reads_for_fraction_chao1(tabella,fraction=0.95,num_points=1000,extend_factor=1.05):
-    results=[]
+    x_eff = min(float(x), float(N))
+    p = abund / N
+    return float(np.sum(1 - (1 - p) ** x_eff))
+
+def rarefaction_curve(abundances, num_points=800):
+    abund = np.asarray(abundances, dtype=float)
+    abund = abund[abund > 0]
+    N = abund.sum()
+    if N <= 0:
+        return np.array([0.0]), np.array([0.0])
+    p = abund / N
+    x = np.linspace(1, N, num=num_points)
+    y = np.sum(1 - (1 - p[:, None]) ** x, axis=0)
+    return x, y
+
+# ================================================================
+# Plot rarefaction (group colors) + vertical line at 200k
+# ================================================================
+def plot_rarefaction(tabella, output_png, sample_to_group, num_points=800, subsample_depth=200000):
+    # Okabe–Ito (colorblind-safe)
+    PALETTE = [
+        "#E69F00",  # orange
+        "#56B4E9",  # sky blue
+        "#009E73",  # bluish green
+        "#F0E442",  # yellow
+        "#0072B2",  # blue
+        "#D55E00",  # vermillion
+        "#CC79A7",  # reddish purple
+    ]
+
+    plt.figure(figsize=(10, 6))
+
+    groups = sorted(set(sample_to_group.values()))
+    group_to_color = {g: PALETTE[i % len(PALETTE)] for i, g in enumerate(groups)}
+
+    groups_plotted = set()
+    max_reads = 0.0
+    curves_plotted = 0
+
     for sample in tabella.index:
-        abundances = tabella.loc[sample].values
-        abundances = abundances[abundances>0]
-        if abundances.size==0:
-            results.append((sample,np.nan,np.nan,np.nan))
+        abund = tabella.loc[sample].values
+        if np.sum(abund) <= 0:
             continue
-        total_species=chao1(abundances)
-        target=total_species*fraction
-        x,y=rarefaction_curve(abundances,num_points=num_points,extend_factor=extend_factor)
-        mask=y>=target
-        reads_needed=x[np.argmax(mask)] if np.any(mask) else x[-1]
-        results.append((sample,total_species,target,reads_needed))
-    return pd.DataFrame(results,columns=['sample','chao1_total_species','target_species','reads_needed'])
 
-# ----------------------------
-# THRESHOLD ANALYSIS
-# ----------------------------
-def rarefaction_thresholds(tabella,p=0.9,num_points=2000):
-    results=[]
+        x, y = rarefaction_curve(abund, num_points=num_points)
+        max_reads = max(max_reads, float(x.max()))
+        curves_plotted += 1
+
+        group = sample_to_group.get(sample, "unknown_group")
+        color = group_to_color.get(group, "#000000")
+
+        if group not in groups_plotted:
+            plt.plot(x, y, color=color, alpha=0.75, linewidth=1.6, label=group)
+            groups_plotted.add(group)
+        else:
+            plt.plot(x, y, color=color, alpha=0.35, linewidth=1.2)
+
+    plt.axvline(
+        subsample_depth,
+        linestyle="--",
+        linewidth=1.5,
+        color="black",
+        alpha=0.85,
+        label=f"Subsampling ({subsample_depth:,} reads)"
+    )
+
+    plt.xlabel("Number of Reads")
+    plt.ylabel("Expected Number of Unique Species/Taxa")
+    plt.title("Rarefaction Curves")
+    plt.grid(True, linestyle="--", alpha=0.3)
+
+    if max_reads > 0:
+        plt.xlim(0, max(max_reads * 1.02, subsample_depth * 1.05))
+
+    plt.ticklabel_format(style="plain", axis="x")
+    plt.legend(title="Groups", loc="best", fontsize="small")
+    plt.tight_layout()
+    plt.savefig(output_png, dpi=300)
+    print(f"✅ Plot rarefazione salvato: {output_png} (curve: {curves_plotted}, gruppi: {len(groups)})")
+
+# ================================================================
+# Compute "% observed species recovered at 200k"
+# ================================================================
+def compute_recovered_observed(tabella, sample_to_group, subsample_depth=200000):
+    rows = []
     for sample in tabella.index:
-        abundances = tabella.loc[sample].values
-        abundances = abundances[abundances>0]
-        if abundances.size==0:
-            results.append((sample,np.nan,np.nan,np.nan,0.0,True))
-            continue
-        total_reads=np.sum(abundances)
-        x,y=rarefaction_curve(abundances,num_points=num_points)
-        a_obs=y.max()
-        xp=x[np.argmax(y>=p*a_obs)] if np.any(y>=p*a_obs) else x[-1]
-        results.append((sample,a_obs,np.nan,xp,y.max(),True))
-    return pd.DataFrame(results,columns=['sample','a','b','x_p','observed_max_species','fallback'])
+        abund = tabella.loc[sample].values
+        total_reads = int(np.sum(abund))
+        S_obs = int(np.sum(np.asarray(abund) > 0))
+        E_Sx = expected_species_at_x(abund, subsample_depth)
+        perc = (E_Sx / S_obs * 100.0) if S_obs > 0 else np.nan
 
-def suggest_subsampling(df_xp):
-    xp=df_xp['x_p'].dropna().values
-    xp_sorted=np.sort(xp)
-    suggestions={'min':float(xp_sorted[0]) if xp_sorted.size>0 else 0.0,
-                 '25pct':float(np.percentile(xp_sorted,25)) if xp_sorted.size>0 else 0.0,
-                 'median':float(np.median(xp_sorted)) if xp_sorted.size>0 else 0.0,
-                 '75pct':float(np.percentile(xp_sorted,75)) if xp_sorted.size>0 else 0.0,
-                 'max':float(xp_sorted[-1]) if xp_sorted.size>0 else 0.0}
-    for r in [1.0,0.9,0.8,0.75,0.5]:
-        suggestions[f'include_{int(r*100)}pct']=float(np.percentile(xp_sorted,r*100) if xp_sorted.size>0 else 0.0)
-    return suggestions
+        rows.append({
+            "sample": sample,
+            "group": sample_to_group.get(sample, "unknown_group"),
+            "total_reads": total_reads,
+            "S_obs": S_obs,
+            f"E_S_at_{subsample_depth}": E_Sx,
+            "percent_observed_recovered": perc
+        })
 
-# ----------------------------
-# PLOTTING
-# ----------------------------
-def plot_box_reads(df_reads,tabella,title,output_file):
-    req=df_reads.set_index('sample')['reads_needed']
-    obs=tabella.sum(axis=1)
-    df_plot=pd.DataFrame({'Observed':obs,'Required (95% Chao1)':req}).melt(var_name='Type',value_name='Reads')
-    plt.figure(figsize=(8,6))
-    if sns:
-        sns.boxplot(x='Type',y='Reads',data=df_plot,palette=['skyblue','salmon'])
-    else:
-        plt.boxplot([df_plot[df_plot['Type']=='Observed']['Reads'],
-                     df_plot[df_plot['Type']=='Required (95% Chao1)']['Reads']],
-                     labels=['Observed','Required'])
-    plt.yscale('log')
-    plt.ylabel('Number of Reads (log scale)')
-    plt.title(title)
-    plt.grid(True,linestyle='--',alpha=0.3)
+    df = pd.DataFrame(rows).sort_values(
+        ["group", "percent_observed_recovered", "total_reads"],
+        ascending=[True, False, False]
+    )
+    return df
+
+# ================================================================
+# Plot "tabellina" (table figure) with results
+# ================================================================
+def plot_results_table(df, output_png, subsample_depth=200000, max_rows=30):
+    """
+    Crea una figura con una tabella (matplotlib) per i risultati.
+    Mostra le prime max_rows righe (ordinate come df).
+    """
+    df_show = df.copy()
+    # arrotondamenti per renderla leggibile
+    col_ES = f"E_S_at_{subsample_depth}"
+    if col_ES in df_show.columns:
+        df_show[col_ES] = df_show[col_ES].round(1)
+    df_show["percent_observed_recovered"] = df_show["percent_observed_recovered"].round(2)
+
+    # limita righe
+    if len(df_show) > max_rows:
+        df_show = df_show.head(max_rows)
+
+    cols = ["group", "sample", "total_reads", "S_obs", col_ES, "percent_observed_recovered"]
+    df_show = df_show[cols]
+
+    fig_h = max(2.5, 0.35 * (len(df_show) + 1))
+    fig, ax = plt.subplots(figsize=(14, fig_h))
+    ax.axis("off")
+
+    title = f"% observed species recovered at {subsample_depth:,} reads (showing top {len(df_show)})"
+    ax.set_title(title, fontsize=12, pad=12)
+
+    table = ax.table(
+        cellText=df_show.values,
+        colLabels=df_show.columns,
+        loc="center",
+        cellLoc="left",
+        colLoc="left"
+    )
+
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    table.scale(1, 1.2)
+
     plt.tight_layout()
-    plt.savefig(output_file,dpi=300)
-    plt.show()
+    plt.savefig(output_png, dpi=300)
+    print(f"✅ Tabellina salvata: {output_png}")
 
-def plot_bar_reads(df_reads,tabella,title,output_file):
-    req=df_reads.set_index('sample')['reads_needed']
-    obs=tabella.sum(axis=1)
-    samples=obs.index
-    x=range(len(samples))
-    plt.figure(figsize=(max(12,len(samples)*0.5),6))
-    plt.bar([i-0.2 for i in x],obs.loc[samples],width=0.4,label='Observed',color='skyblue')
-    plt.bar([i+0.2 for i in x],req.loc[samples],width=0.4,label='Required (95% Chao1)',color='salmon')
-    plt.xticks(x,samples,rotation=90)
-    plt.ylabel('Number of Reads')
-    plt.title(title)
-    plt.legend()
-    plt.grid(True,axis='y',linestyle='--',alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(output_file,dpi=300)
-    plt.show()
+# ================================================================
+# MAIN
+# ================================================================
+parser = argparse.ArgumentParser(
+    description="From *_taxonomy.txt: build sample×taxa table, plot rarefaction with group colors, and compute % observed species recovered at 200k."
+)
+parser.add_argument("input_dir", help="Directory radice dove cercare i file *_taxonomy.txt (ricorsivo)")
+parser.add_argument("--suffix", default="_taxonomy.txt", help="Suffisso dei file taxonomy (default: _taxonomy.txt)")
+parser.add_argument("--out_prefix", default="rarefaction", help="Prefisso output (default: rarefaction)")
+parser.add_argument("--num_points", type=int, default=800, help="Punti per curva rarefazione (default 800)")
+parser.add_argument("--subsample_depth", type=int, default=200000, help="Subsampling depth (default 200000)")
+parser.add_argument("--table_rows", type=int, default=30, help="Numero massimo di righe nella tabellina (default 30)")
+args = parser.parse_args()
 
-def plot_rarefaction_subplot(tab_adults,tab_nymphs,group_map,output_file,subsample_depth=200000):
-    fig, axes = plt.subplots(1,2,figsize=(14,6),sharey=True)
-    datasets={"Adults":(tab_adults,axes[0]),"Nymphs":(tab_nymphs,axes[1])}
-    for title,(tab,ax) in datasets.items():
-        sample_to_group={s:'_'.join(s.split('_')[:-1]) for s in tab.index}
-        groups=sorted(set(sample_to_group.values()))
-        for i,group in enumerate(groups):
-            color=PALETTE_GROUPS[i%len(PALETTE_GROUPS)]
-            for sample in tab.index:
-                if sample_to_group[sample]!=group: continue
-                abundances=tab.loc[sample].values
-                abundances=abundances[abundances>0]
-                if abundances.size==0: continue
-                x,y=rarefaction_curve(abundances,num_points=800)
-                ax.plot(x,y,color=color,alpha=0.8,linewidth=1.6,label=group_map.get(group,group))
-        ax.set_title(title)
-        ax.set_xlabel("Sequencing depth (reads)")
-        ax.axvline(subsample_depth,linestyle="--",linewidth=1.5,color="black",alpha=0.8,label=f"Subsampling depth ({subsample_depth:,} reads)")
-        ax.grid(alpha=0.3)
-    axes[0].set_ylabel("Expected number of taxa")
-    for ax in axes:
-        handles, labels = ax.get_legend_handles_labels()
-        by_label=dict(zip(labels,handles))
-        ax.legend(by_label.values(),by_label.keys(),title="Groups",fontsize="small")
-    plt.tight_layout()
-    plt.savefig(output_file,dpi=300)
-    plt.show()
+root = args.input_dir
+if not os.path.isdir(root):
+    raise SystemExit(f"Errore: '{root}' non è una directory.")
 
-# ----------------------------
-# MAIN EXECUTION
-# ----------------------------
-TAX_FILE = "path/to/taxonomy_file.txt"
+files = find_taxonomy_files(root, args.suffix, recursive=True)
+if not files:
+    raise SystemExit(f"Nessun file trovato con suffisso '{args.suffix}' sotto {root}")
 
-# Aggregate counts
-tab_adults = aggregate_counts(ADULT_FOLDERS,TAX_FILE)
-tab_nymphs = aggregate_counts(NYMPH_FOLDERS,TAX_FILE)
+print(f"File taxonomy trovati: {len(files)}")
 
-# Rarefaction + threshold
-df_reads_adults=reads_for_fraction_chao1(tab_adults, fraction=0.95)
-df_reads_nymphs=reads_for_fraction_chao1(tab_nymphs, fraction=0.95)
+tabella, sample_to_group = build_table(files, root, args.suffix)
 
-plot_box_reads(df_reads_adults,tab_adults,"Adults: Observed vs Required Reads (95% Chao1)","path/to/output/boxplot_reads_adults.png")
-plot_bar_reads(df_reads_adults,tab_adults,"Adults: Reads per Sample (95% Chao1)","path/to/output/barplot_reads_adults.png")
-plot_box_reads(df_reads_nymphs,tab_nymphs,"Nymphs: Observed vs Required Reads (95% Chao1)","path/to/output/boxplot_reads_nymphs.png")
-plot_bar_reads(df_reads_nymphs,tab_nymphs,"Nymphs: Reads per Sample (95% Chao1)","path/to/output/barplot_reads_nymphs.png")
+# Output: salvati nella directory input (root)
+out_table_csv = os.path.join(root, f"{args.out_prefix}_table.csv")
+out_raref_png = os.path.join(root, f"{args.out_prefix}_curves.png")
+out_reco_csv  = os.path.join(root, f"{args.out_prefix}_recovered_observed_{args.subsample_depth}.csv")
+out_tab_png   = os.path.join(root, f"{args.out_prefix}_recovered_observed_table_{args.subsample_depth}.png")
 
-plot_rarefaction_subplot(tab_adults,tab_nymphs,GROUP_NAME_MAP,"path/to/output/rarefaction_subplot.png")
+tabella.to_csv(out_table_csv)
+print(f"✅ Tabella campioni×taxa salvata in: {out_table_csv}")
 
+plot_rarefaction(
+    tabella, out_raref_png, sample_to_group,
+    num_points=args.num_points,
+    subsample_depth=args.subsample_depth
+)
+
+df_rec = compute_recovered_observed(tabella, sample_to_group, subsample_depth=args.subsample_depth)
+df_rec.to_csv(out_reco_csv, index=False)
+print(f"✅ Risultati (% observed recovered) salvati in: {out_reco_csv}")
+
+plot_results_table(df_rec, out_tab_png, subsample_depth=args.subsample_depth, max_rows=args.table_rows)
+
+print("\n📊 Preview (prime 10 righe):")
+print(df_rec.head(10).to_string(index=False))
