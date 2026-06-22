@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import os
 import re
-import sys
 import argparse
 
 # usage:
@@ -10,21 +9,10 @@ import argparse
 _CIGAR_RE = re.compile(r'(\d+)([MIDNSHP=X])')
 
 def get_aligned_bases_on_read(cigar: str) -> int:
-    """
-    Basi della read effettivamente coinvolte nell'allineamento sul read:
-      M + I + = + X
-    (NON include S; NON include D/N perché sono sul riferimento)
-    """
     ops = _CIGAR_RE.findall(cigar)
     return sum(int(n) for n, op in ops if op in ('M', 'I', '=', 'X'))
 
 def extract_error_rate(line: str, aligned_bases: int):
-    """
-    Ritorna error_rate oppure None se non disponibile.
-    Priorità:
-      - de:f:<float> (se presente) usato direttamente
-      - altrimenti NM:i:<int> / aligned_bases
-    """
     de_match = re.search(r'\bde:f:([\d\.eE-]+)\b', line)
     if de_match:
         return float(de_match.group(1))
@@ -38,7 +26,6 @@ def extract_error_rate(line: str, aligned_bases: int):
 def filter_sam(input_file, output_file, max_error, min_len, max_len, min_cov):
     total_alignments = kept_alignments = lost_alignments = 0
 
-    # contatori "perché ho perso i record"
     lost_unmapped = 0
     lost_malformed = 0
     lost_no_seq = 0
@@ -48,7 +35,6 @@ def filter_sam(input_file, output_file, max_error, min_len, max_len, min_cov):
     lost_no_tags = 0
     lost_error = 0
 
-    # contatori "quante read perdo completamente"
     read_ids_seen = set()
     read_ids_kept = set()
 
@@ -82,7 +68,6 @@ def filter_sam(input_file, output_file, max_error, min_len, max_len, min_cov):
 
             read_len = len(seq)
 
-            # filtro lunghezza read (SEQ)
             if not (min_len <= read_len <= max_len):
                 lost_alignments += 1
                 lost_len += 1
@@ -94,14 +79,13 @@ def filter_sam(input_file, output_file, max_error, min_len, max_len, min_cov):
                 lost_zero_aln += 1
                 continue
 
-            # filtro coverage
+
             cov = aligned_bases / read_len
             if cov < min_cov:
                 lost_alignments += 1
                 lost_cov += 1
                 continue
 
-            # filtro error rate
             error_rate = extract_error_rate(line, aligned_bases)
             if error_rate is None:
                 lost_alignments += 1
@@ -129,8 +113,7 @@ def filter_sam(input_file, output_file, max_error, min_len, max_len, min_cov):
 
     total_reads = len(read_ids_seen)
     kept_reads = len(read_ids_kept)
-    lost_reads = total_reads - kept_reads  # read "perse completamente"
-
+    lost_reads = total_reads - kept_reads 
     return total_alignments, kept_alignments, lost_alignments, breakdown, total_reads, kept_reads, lost_reads
 
 def pct(num, den):
@@ -147,9 +130,7 @@ def print_summary(total_aln, kept_aln, lost_aln, breakdown, total_reads, kept_re
     print(f"Reads with ≥1 valid alignment: {kept_reads}")
     print(f"Reads lost completely: {lost_reads} ({pct(lost_reads, total_reads):.2f}%)")
 
-# ----------------------------
-# MAIN with argparse
-# ----------------------------
+
 parser = argparse.ArgumentParser(description="Filter SAM files by error rate + read length + coverage; also report reads lost completely")
 parser.add_argument("input", help="Input SAM file or folder")
 
