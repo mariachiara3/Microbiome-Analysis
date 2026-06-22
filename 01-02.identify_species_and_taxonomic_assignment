@@ -6,15 +6,11 @@ import argparse
 
 _CIGAR_RE = re.compile(r'(\d+)([MIDNSHP=X])')
 
-def calcola_lunghezza_allineamento_ref(cigar: str) -> int:
-    """
-    Lunghezza dell'allineamento sul riferimento:
-      M + D + = + X
-    """
+def calculate_reference_alignment_length(cigar: str) -> int:
     ops = _CIGAR_RE.findall(cigar)
     return sum(int(n) for n, op in ops if op in ('M', 'D', '=', 'X'))
 
-def estrai_AS(fields):
+def exstract_AS(fields):
     for x in fields:
         if x.startswith('AS:i:'):
             try:
@@ -23,7 +19,7 @@ def estrai_AS(fields):
                 return None
     return None
 
-def carica_tassonomia(taxonomy_file: str):
+def load_taxonomy(taxonomy_file: str):
     tax_dict = {}
     with open(taxonomy_file, "r", encoding="utf-8") as f:
         for line in f:
@@ -42,12 +38,12 @@ def pad_taxonomy_to_7(taxonomy: str):
         parts = parts + ["unknown"] * (7 - len(parts))
     return parts[:7]
 
-def normalizza_full_taxonomy(raw_taxonomy: str):
+def normalize_full_taxonomy(raw_taxonomy: str):
     if raw_taxonomy is None:
         return "unknown;unknown;unknown;unknown;unknown;unknown;unknown"
     return ";".join(pad_taxonomy_to_7(raw_taxonomy))
 
-def genera_chiave_aggregazione(full_taxonomy: str):
+def generate:aggregation_key(full_taxonomy: str):
     parts = [p.strip() for p in full_taxonomy.split(';') if p.strip() != '']
     if len(parts) < 7:
         return "unknown_unknown"
@@ -93,7 +89,7 @@ def taxonomy_specificity_score(raw_taxonomy: str):
 
     return (informative_species, real_depth, informative_genus)
 
-def hit_migliore(new_hit, old_hit, as_tolerance=500):
+def better_hit(new_hit, old_hit, as_tolerance=500):
     new_AS = new_hit["AS"]
     old_AS = old_hit["AS"]
 
@@ -112,10 +108,7 @@ def hit_migliore(new_hit, old_hit, as_tolerance=500):
 
     return new_hit["lunghezza_ref"] > old_hit["lunghezza_ref"]
 
-# --------------------------------------------------
-# Core
-# --------------------------------------------------
-def processa_sam_con_tassonomia(
+def process_sam_with_taxonomy(
     file_in,
     file_out,
     tax_dict,
@@ -146,12 +139,12 @@ def processa_sam_con_tassonomia(
                 reads_cigar_zero += 1
                 continue
 
-            AS = estrai_AS(fields)
+            AS = extract_AS(fields)
             if AS is None:
-                reads_senza_AS += 1
+                reads_without_AS += 1
                 continue
 
-            lunghezza_ref = calcola_lunghezza_allineamento_ref(cigar)
+            reference_length = calculate_reference_alignment_length(cigar)
             raw_taxonomy = tax_dict.get(ref_id)
 
             if raw_taxonomy is None:
@@ -159,7 +152,7 @@ def processa_sam_con_tassonomia(
                     unknown_tax_ids_seen.add(ref_id)
                     unknown_tax_ids += 1
                     if unknown_tax_ids <= max_warn_unknown:
-                        print(f"⚠️ WARNING: ref_id senza tassonomia nel mapping: {ref_id}")
+                        print(f"⚠️ WARNING: ref_id missing from taxonomy mapping: {ref_id}")
 
             new_hit = {
                 "AS": AS,
@@ -185,7 +178,7 @@ def processa_sam_con_tassonomia(
 
     for read_id, hit in best_hit_per_read.items():
         AS = hit["AS"]
-        lunghezza_ref = hit["lunghezza_ref"]
+        reference_length = hit["refence_length"]
         ref_id = hit["ref_id"]
         raw_taxonomy = hit["raw_taxonomy"]
 
@@ -197,8 +190,8 @@ def processa_sam_con_tassonomia(
 
         kept_reads += 1
 
-        full_taxonomy = normalizza_full_taxonomy(raw_taxonomy)
-        key = genera_chiave_aggregazione(full_taxonomy)
+        full_taxonomy = normalize_full_taxonomy(raw_taxonomy)
+        key = generate_aggregation_key(full_taxonomy)
 
         if key in aggregated_data:
             aggregated_data[key]["count"] += 1
@@ -214,29 +207,27 @@ def processa_sam_con_tassonomia(
 
     sample_name = os.path.basename(file_in)
 
-    print(f"📊 Campione: {sample_name}")
-    print(f"   Reads con almeno un allineamento e AS: {total_reads}")
-    print(f"   Reads conservate (best-hit full-length): {kept_reads}")
-    print(f"   Reads perse per lunghezza: {lost_reads} "
-          f"({(lost_reads / total_reads * 100 if total_reads else 0):.2f}%)")
-    print(f"   Reads non allineate (CIGAR='*'): {reads_cigar_zero}")
-    print(f"   Reads senza tag AS: {reads_senza_AS}")
-    print(f"   ref_id senza tassonomia nel mapping: {len(unknown_tax_ids_seen)}")
-    print(f"   Taxa finali aggregati: {len(aggregated_data)}")
-
-    if reads_scartate_ids:
-        print(f"   🗑️ Prime 2 reads scartate: {', '.join(reads_scartate_ids)}")
-
+    print(f"Sample: {sample_name}")
+    print(f" Reads with at least one alignment and AS tag: {total_reads}")
+    print(f" Kept reads (best-hit full-length): {kept_reads}")
+    print(f" Reads lost by length: {lost_reads} "
+    f"({(lost_reads / total_reads * 100 if total_reads else 0):.2f}%)")
+    print(f" Unaligned reads (CIGAR='*'): {reads_with_empty_cigar}")
+    print(f" Reads without AS tag: {reads_without_AS}")
+    print(f" ref_ids missing from taxonomy mapping: {len(unknown_tax_ids_seen)}")
+    print(f" Final aggregated taxa: {len(aggregated_data)}")
+    
+    if discarded_read_ids:
+    print(f" First 2 discarded reads: {', '.join(discarded_read_ids)}")
+    
     print("-" * 70)
 
-# --------------------------------------------------
-# MAIN
-# --------------------------------------------------
+
 parser = argparse.ArgumentParser(
     description=(
-        "Processa file SAM ricorsivamente, sceglie il best hit per read usando "
-        "AS e specificità tassonomica, filtra per lunghezza e scrive output "
-        "taxonomy.txt aggregato."
+        "Recursively process SAM files, choose the best hit per read using "
+        "AS and taxonomic specificity, filter by length, and write aggregated "
+        "taxonomy.txt output."
     )
 )
 parser.add_argument("input_dir", help="Directory radice")
@@ -255,18 +246,17 @@ parser.add_argument("--max_len", type=int, default=1800)
 parser.add_argument(
     "--out_suffix",
     default="taxonomy.txt",
-    help="Suffisso output (default: taxonomy.txt)"
+    help="Output suffix (default: taxonomy.txt)"
 )
 args = parser.parse_args()
 
 root = args.input_dir
 
 if not os.path.isdir(root):
-    print(f"Errore: '{root}' non è una directory.")
+    print(f"Errore: '{root}' is not a directory.")
     raise SystemExit(1)
 
-tax_dict = carica_tassonomia(args.taxonomy_file)
-print(f"Tassonomie caricate: {len(tax_dict)}")
+tax_dict = load_taxonomy (args.taxonomy_file)
 
 found_any = False
 
@@ -277,7 +267,7 @@ for dirpath, dirnames, filenames in os.walk(root):
             input_file = os.path.join(dirpath, fn)
             output_file = os.path.splitext(input_file)[0] + args.out_suffix
 
-            processa_sam_con_tassonomia(
+            process_sam_with_taxonomy(
                 input_file,
                 output_file,
                 tax_dict,
@@ -286,4 +276,4 @@ for dirpath, dirnames, filenames in os.walk(root):
             )
 
 if not found_any:
-    print(f"Nessun file con suffisso '{args.pattern}' trovato sotto {root}")
+    print(f"No files with suffix '{args.pattern}' found under {root}")
