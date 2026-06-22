@@ -6,7 +6,6 @@ import argparse
 
 # usage:
 #   python3 filtraggio_percentuale_errore_sam.py path/to/file.sam --max_error 0.02 --min_len 1300 --max_len 1700 --min_cov 0.90
-#   python3 filtraggio_percentuale_errore_sam.py path/to/folder    --max_error 0.02 --min_len 1300 --max_len 1700 --min_cov 0.90
 
 _CIGAR_RE = re.compile(r'(\d+)([MIDNSHP=X])')
 
