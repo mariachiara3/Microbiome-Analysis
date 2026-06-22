@@ -1,0 +1,319 @@
+#!/usr/bin/env python3
+import re
+from collections import defaultdict
+import os
+import argparse
+
+# --------------------------------------------------
+# Helper SAM
+# --------------------------------------------------
+_CIGAR_RE = re.compile(r'(\d+)([MIDNSHP=X])')
+
+def calcola_lunghezza_allineamento_ref(cigar: str) -> int:
+    """
+    Lunghezza dell'allineamento sul riferimento:
+      M + D + = + X
+    """
+    ops = _CIGAR_RE.findall(cigar)
+    return sum(int(n) for n, op in ops if op in ('M', 'D', '=', 'X'))
+
+def estrai_AS(fields):
+    for x in fields:
+        if x.startswith('AS:i:'):
+            try:
+                return int(x[5:])
+            except ValueError:
+                return None
+    return None
+
+# --------------------------------------------------
+# Helper tassonomia
+# --------------------------------------------------
+def carica_tassonomia(taxonomy_file: str):
+    """
+    Carica mapping:
+      ID<TAB o spazio>taxonomy
+    """
+    tax_dict = {}
+    with open(taxonomy_file, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(None, 1)
+            if len(parts) == 2:
+                id_, taxonomy = parts
+                tax_dict[id_] = taxonomy
+    return tax_dict
+
+def pad_taxonomy_to_7(taxonomy: str):
+    """
+    Porta la tassonomia a 7 livelli con 'unknown'.
+    """
+    parts = [p.strip() for p in taxonomy.split(';') if p.strip() != '']
+    if len(parts) < 7:
+        parts = parts + ["unknown"] * (7 - len(parts))
+    return parts[:7]
+
+def normalizza_full_taxonomy(raw_taxonomy: str):
+    """
+    Restituisce sempre una full taxonomy coerente a 7 livelli.
+    """
+    if raw_taxonomy is None:
+        return "unknown;unknown;unknown;unknown;unknown;unknown;unknown"
+    return ";".join(pad_taxonomy_to_7(raw_taxonomy))
+
+def genera_chiave_aggregazione(full_taxonomy: str):
+    """
+    Chiave specie-like per aggregazione.
+    """
+    parts = [p.strip() for p in full_taxonomy.split(';') if p.strip() != '']
+    if len(parts) < 7:
+        return "unknown_unknown"
+
+    genus = parts[5].lower()
+    species = parts[6].lower()
+
+    if species in ['uncultured_bacterium', 'uncultured_organism']:
+        return f"{genus}_{species}"
+
+    if '_' not in species:
+        return f"{genus}_{species}"
+    return species
+
+def is_generic_species_label(species: str) -> bool:
+    """
+    Etichette che NON vuoi preferire quando esiste una specie più informativa.
+    """
+    bad = {
+        "unknown",
+        "uncultured",
+        "uncultured_bacterium",
+        "uncultured_organism",
+        "uncultured_microorganism",
+        "bacterium",
+        "organism",
+        "metagenome",
+        "unclassified",
+        "unidentified",
+    }
+    return species.strip().lower() in bad
+
+def taxonomy_specificity_score(raw_taxonomy: str):
+    """
+    Score lessicografico: maggiore = tassonomia migliore/più specifica.
+
+    Ordine:
+    1. specie informativa vs generica
+    2. profondità reale nota prima del padding
+    3. genus informativo vs unknown
+    """
+    if raw_taxonomy is None:
+        return (0, 0, 0)
+
+    raw_parts = [p.strip() for p in raw_taxonomy.split(';') if p.strip() != '']
+    padded = pad_taxonomy_to_7(raw_taxonomy)
+
+    genus = padded[5].lower()
+    species = padded[6].lower()
+
+    informative_species = 0 if is_generic_species_label(species) else 1
+    real_depth = len(raw_parts)
+    informative_genus = 0 if genus == "unknown" else 1
+
+    return (informative_species, real_depth, informative_genus)
+
+def hit_migliore(new_hit, old_hit, as_tolerance=500):
+    new_AS = new_hit["AS"]
+    old_AS = old_hit["AS"]
+
+    if new_AS > old_AS + as_tolerance:
+        return True
+    if old_AS > new_AS + as_tolerance:
+        return False
+
+    new_spec = taxonomy_specificity_score(new_hit["raw_taxonomy"])
+    old_spec = taxonomy_specificity_score(old_hit["raw_taxonomy"])
+
+    if new_spec > old_spec:
+        return True
+    if new_spec < old_spec:
+        return False
+
+    return new_hit["lunghezza_ref"] > old_hit["lunghezza_ref"]
+
+# --------------------------------------------------
+# Core
+# --------------------------------------------------
+def processa_sam_con_tassonomia(
+    file_in,
+    file_out,
+    tax_dict,
+    min_len=800,
+    max_len=2000,
+    max_warn_unknown=5
+):
+    best_hit_per_read = {}
+    reads_cigar_zero = 0
+    reads_senza_AS = 0
+    unknown_tax_ids = 0
+    unknown_tax_ids_seen = set()
+
+    with open(file_in, 'r', encoding='utf-8') as f_in:
+        for line in f_in:
+            if line.startswith('@'):
+                continue
+
+            fields = line.rstrip('\n').split('\t')
+            if len(fields) < 11:
+                continue
+
+            read_id = fields[0]
+            ref_id = fields[2]
+            cigar = fields[5]
+
+            if cigar == '*':
+                reads_cigar_zero += 1
+                continue
+
+            AS = estrai_AS(fields)
+            if AS is None:
+                reads_senza_AS += 1
+                continue
+
+            lunghezza_ref = calcola_lunghezza_allineamento_ref(cigar)
+            raw_taxonomy = tax_dict.get(ref_id)
+
+            if raw_taxonomy is None:
+                if ref_id not in unknown_tax_ids_seen:
+                    unknown_tax_ids_seen.add(ref_id)
+                    unknown_tax_ids += 1
+                    if unknown_tax_ids <= max_warn_unknown:
+                        print(f"⚠️ WARNING: ref_id senza tassonomia nel mapping: {ref_id}")
+
+            new_hit = {
+                "AS": AS,
+                "lunghezza_ref": lunghezza_ref,
+                "ref_id": ref_id,
+                "raw_taxonomy": raw_taxonomy,
+            }
+
+            if read_id not in best_hit_per_read:
+                best_hit_per_read[read_id] = new_hit
+            else:
+                old_hit = best_hit_per_read[read_id]
+                if hit_migliore(new_hit, old_hit):
+                    best_hit_per_read[read_id] = new_hit
+
+    total_reads = len(best_hit_per_read)
+    kept_reads = 0
+    lost_reads = 0
+    reads_scartate_ids = []
+
+    aggregated_data = {}
+    species_preferred_count = 0
+
+    for read_id, hit in best_hit_per_read.items():
+        AS = hit["AS"]
+        lunghezza_ref = hit["lunghezza_ref"]
+        ref_id = hit["ref_id"]
+        raw_taxonomy = hit["raw_taxonomy"]
+
+        if not (min_len <= lunghezza_ref <= max_len):
+            lost_reads += 1
+            if len(reads_scartate_ids) < 2:
+                reads_scartate_ids.append(read_id)
+            continue
+
+        kept_reads += 1
+
+        full_taxonomy = normalizza_full_taxonomy(raw_taxonomy)
+        key = genera_chiave_aggregazione(full_taxonomy)
+
+        if key in aggregated_data:
+            aggregated_data[key]["count"] += 1
+        else:
+            aggregated_data[key] = {
+                "full_taxonomy": full_taxonomy,
+                "count": 1
+            }
+
+    with open(file_out, "w", encoding="utf-8") as out:
+        for data in aggregated_data.values():
+            out.write(f"{data['full_taxonomy']}\t{data['count']}\n")
+
+    sample_name = os.path.basename(file_in)
+
+    print(f"📊 Campione: {sample_name}")
+    print(f"   Reads con almeno un allineamento e AS: {total_reads}")
+    print(f"   Reads conservate (best-hit full-length): {kept_reads}")
+    print(f"   Reads perse per lunghezza: {lost_reads} "
+          f"({(lost_reads / total_reads * 100 if total_reads else 0):.2f}%)")
+    print(f"   Reads non allineate (CIGAR='*'): {reads_cigar_zero}")
+    print(f"   Reads senza tag AS: {reads_senza_AS}")
+    print(f"   ref_id senza tassonomia nel mapping: {len(unknown_tax_ids_seen)}")
+    print(f"   Taxa finali aggregati: {len(aggregated_data)}")
+
+    if reads_scartate_ids:
+        print(f"   🗑️ Prime 2 reads scartate: {', '.join(reads_scartate_ids)}")
+
+    print("-" * 70)
+
+# --------------------------------------------------
+# MAIN
+# --------------------------------------------------
+parser = argparse.ArgumentParser(
+    description=(
+        "Processa file SAM ricorsivamente, sceglie il best hit per read usando "
+        "AS e specificità tassonomica, filtra per lunghezza e scrive output "
+        "taxonomy.txt aggregato."
+    )
+)
+parser.add_argument("input_dir", help="Directory radice")
+parser.add_argument(
+    "--taxonomy_file",
+    required=True,
+    help="File mapping ID -> tassonomia"
+)
+parser.add_argument(
+    "--pattern",
+    default="discarded.sam",
+    help="Suffisso dei file SAM filtrati (default: discarded.sam)"
+)
+parser.add_argument("--min_len", type=int, default=1200)
+parser.add_argument("--max_len", type=int, default=1800)
+parser.add_argument(
+    "--out_suffix",
+    default="taxonomy.txt",
+    help="Suffisso output (default: taxonomy.txt)"
+)
+args = parser.parse_args()
+
+root = args.input_dir
+
+if not os.path.isdir(root):
+    print(f"Errore: '{root}' non è una directory.")
+    raise SystemExit(1)
+
+tax_dict = carica_tassonomia(args.taxonomy_file)
+print(f"Tassonomie caricate: {len(tax_dict)}")
+
+found_any = False
+
+for dirpath, dirnames, filenames in os.walk(root):
+    for fn in filenames:
+        if fn.endswith(args.pattern):
+            found_any = True
+            input_file = os.path.join(dirpath, fn)
+            output_file = os.path.splitext(input_file)[0] + args.out_suffix
+
+            processa_sam_con_tassonomia(
+                input_file,
+                output_file,
+                tax_dict,
+                min_len=args.min_len,
+                max_len=args.max_len
+            )
+
+if not found_any:
+    print(f"Nessun file con suffisso '{args.pattern}' trovato sotto {root}")
