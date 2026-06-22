@@ -6,7 +6,7 @@ import argparse
 
 _CIGAR_RE = re.compile(r'(\d+)([MIDNSHP=X])')
 
-def calculate_reference_alignment_length (cigar: str) -> int:
+def calculate_reference_alignment_length(cigar: str) -> int:
     ops = _CIGAR_RE.findall(cigar)
     return sum(int(n) for n, op in ops if op in ('M', 'D', '=', 'X'))
 
