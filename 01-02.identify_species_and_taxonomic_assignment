@@ -4,9 +4,6 @@ from collections import defaultdict
 import os
 import argparse
 
-# --------------------------------------------------
-# Helper SAM
-# --------------------------------------------------
 _CIGAR_RE = re.compile(r'(\d+)([MIDNSHP=X])')
 
 def calcola_lunghezza_allineamento_ref(cigar: str) -> int:
@@ -26,14 +23,7 @@ def estrai_AS(fields):
                 return None
     return None
 
-# --------------------------------------------------
-# Helper tassonomia
-# --------------------------------------------------
 def carica_tassonomia(taxonomy_file: str):
-    """
-    Carica mapping:
-      ID<TAB o spazio>taxonomy
-    """
     tax_dict = {}
     with open(taxonomy_file, "r", encoding="utf-8") as f:
         for line in f:
@@ -47,26 +37,17 @@ def carica_tassonomia(taxonomy_file: str):
     return tax_dict
 
 def pad_taxonomy_to_7(taxonomy: str):
-    """
-    Porta la tassonomia a 7 livelli con 'unknown'.
-    """
     parts = [p.strip() for p in taxonomy.split(';') if p.strip() != '']
     if len(parts) < 7:
         parts = parts + ["unknown"] * (7 - len(parts))
     return parts[:7]
 
 def normalizza_full_taxonomy(raw_taxonomy: str):
-    """
-    Restituisce sempre una full taxonomy coerente a 7 livelli.
-    """
     if raw_taxonomy is None:
         return "unknown;unknown;unknown;unknown;unknown;unknown;unknown"
     return ";".join(pad_taxonomy_to_7(raw_taxonomy))
 
 def genera_chiave_aggregazione(full_taxonomy: str):
-    """
-    Chiave specie-like per aggregazione.
-    """
     parts = [p.strip() for p in full_taxonomy.split(';') if p.strip() != '']
     if len(parts) < 7:
         return "unknown_unknown"
@@ -82,9 +63,6 @@ def genera_chiave_aggregazione(full_taxonomy: str):
     return species
 
 def is_generic_species_label(species: str) -> bool:
-    """
-    Etichette che NON vuoi preferire quando esiste una specie più informativa.
-    """
     bad = {
         "unknown",
         "uncultured",
@@ -100,14 +78,6 @@ def is_generic_species_label(species: str) -> bool:
     return species.strip().lower() in bad
 
 def taxonomy_specificity_score(raw_taxonomy: str):
-    """
-    Score lessicografico: maggiore = tassonomia migliore/più specifica.
-
-    Ordine:
-    1. specie informativa vs generica
-    2. profondità reale nota prima del padding
-    3. genus informativo vs unknown
-    """
     if raw_taxonomy is None:
         return (0, 0, 0)
 
