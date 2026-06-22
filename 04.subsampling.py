@@ -1,22 +1,4 @@
 #!/usr/bin/env python3
-"""
-Subsampling WITHOUT replacement + global matrix output.
-
-Per ogni file input che termina con --suffix (ricorsivo da input_root):
-- subsample a --depth senza replacement
-- salva SOLO il TXT dei counts accanto al file input:
-    <base>_subsampled_taxa.txt   (tab-separated, no header)
-
-Nella cartella input_root salva SOLO:
-- subsampled_matrix_counts.csv
-  righe = campioni (ordinati per trattamento secondo SUFFIX_ORDER)
-  colonne = taxa
-  valori = count subsampled (0 se assente)
-
-Esempio:
-python3 subsampling_matrix.py /path/to/root \
-  --suffix "tassonomia.txt" --depth 135000 --seed 123 --repeat_threshold 3500000
-"""
 
 import os
 import argparse
@@ -27,9 +9,6 @@ import pandas as pd
 import gc
 
 
-# -----------------------
-# Treatment ordering
-# -----------------------
 SUFFIX_ORDER = ["control", "ethanol", "bleach", "DNA_RNA_zap", "lyzo_bleach", "lyzo_zap"]
 
 def _tokenize_path(sample_id: str):
@@ -46,10 +25,7 @@ def _tokenize_path(sample_id: str):
     return chunks
 
 def extract_treatment(sample_id: str, order=SUFFIX_ORDER):
-    """
-    Riconosce il trattamento cercando una sequenza di token.
-    Priorità ai trattamenti più specifici (più token), es: lyzo_bleach prima di bleach.
-    """
+
     tokens = _tokenize_path(sample_id)
 
     # prepara pattern come lista di token per ogni trattamento
@@ -76,9 +52,6 @@ def treatment_rank(sample_id: str, order=SUFFIX_ORDER):
         return len(order) + 999
     return order.index(t)
 
-# -----------------------
-# Helpers
-# -----------------------
 def find_input_files(root_dir, suffix):
     matches = []
     for dirpath, _, filenames in os.walk(root_dir):
@@ -109,9 +82,6 @@ def make_per_file_txt_path(input_filepath, in_suffix):
     return out_txt
 
 
-# -----------------------
-# hypergeometric sequential fallback (low RAM)
-# -----------------------
 def sample_counts_without_replacement_seq(counts, n, rng):
     counts = np.asarray(counts, dtype=int).copy()
     N = int(counts.sum())
@@ -150,9 +120,6 @@ def sample_counts_without_replacement_seq(counts, n, rng):
     return sampled
 
 
-# -----------------------
-# fast expansion + choice (fast but uses RAM proportional to N)
-# -----------------------
 def subsample_without_replacement_fast(df, depth, rng):
     taxa = df["taxonomy"].to_numpy(dtype=object)
     counts = df["count"].to_numpy(dtype=int)
@@ -174,9 +141,6 @@ def subsample_without_replacement_fast(df, depth, rng):
     return df_sub, N
 
 
-# -----------------------
-# process one file
-# -----------------------
 def process_file(filepath, root, depth, in_suffix, rng, repeat_threshold, verbose=True):
     t_start = time.time()
     sample_id = os.path.relpath(filepath, root)  # per evitare collisioni
@@ -280,9 +244,6 @@ def process_file(filepath, root, depth, in_suffix, rng, repeat_threshold, verbos
         }, None
 
 
-# -----------------------
-# main
-# -----------------------
 def main():
     p = argparse.ArgumentParser(description="Subsampling + global counts matrix (ordered by treatment)")
     p.add_argument("input_root", help="root dir containing input files (recursive search)")
