@@ -1,28 +1,8 @@
 #!/usr/bin/env python3
 """
-05.diversity.py
-Diversity (alpha/beta) + Abundance (stacked bar genus/species) from sample×taxa CSV tables.
-
-Expected CSV format:
-- First column = sample id/path (e.g. nymphs_control/05_filtered_taxonomy.txt)
-- Other columns = taxonomy strings separated by ';'
-  e.g. bacteria;proteobacteria;...;genus;species
-- Values = counts (ints)
-
-ANALYSIS LOGIC (as requested)
-1) GLOBAL tests across ALL treatments:
-   - Alpha diversity (Shannon, Simpson concentration): Kruskal–Wallis
-   - Beta diversity (Bray–Curtis on relative abundance, Jaccard on presence/absence):
-     PERMANOVA with permutations
-2) Post-hoc ONLY treatment vs control (planned comparisons), executed only when the global test is significant:
-   - Alpha: Wilcoxon rank-sum (SciPy ranksums) for each treatment vs control
-   - Beta: pairwise PERMANOVA for each treatment vs control
-3) Multiple-testing correction is applied ONLY within the family of “vs control” tests
-   for each metric (e.g., Shannon family; Simpson family; BrayCurtis family; Jaccard family),
-   default = Holm (less “aggressive” than FDR in small families, while controlling FWER).
 
 Usage:
-python3 05.diversity.py \
+python3 05.taxonomic_composition_and_diversity_analyses.py \
   --adults_csv  /path/adults.csv \
   --nymphs_csv  /path/nymphs.csv \
   --out_dir     /path/out \
@@ -52,13 +32,11 @@ import seaborn as sns
 
 from scipy.spatial.distance import pdist, squareform
 from scipy.linalg import eigh
-from scipy.stats import kruskal, ranksums  # Wilcoxon rank-sum (independent)
+from scipy.stats import kruskal, mannwhitneyu # Wilcoxon rank-sum (independent)
 from statsmodels.stats.multitest import multipletests
 
 
-# ============================================================
-# 0) Publication-quality plotting defaults (NO Arial warning)
-# ============================================================
+
 def setup_publication_style():
     preferred = ["Arial", "Liberation Sans", "DejaVu Sans"]
     installed = {f.name for f in font_manager.fontManager.ttflist}
@@ -86,9 +64,7 @@ def setup_publication_style():
     print(f"[plotting] chosen font: {chosen}")
 
 
-# ============================================================
-# 1) Treatment colors (normalized tokens)
-# ============================================================
+
 BASE_COLORS = {
     "control":     "#0C7BDC",
     "ethanol":     "#D35FB7",
@@ -99,9 +75,6 @@ BASE_COLORS = {
 }
 
 
-# ============================================================
-# 2) Treatment parsing from sample names
-# ============================================================
 def normalize_label_cli(label: str) -> str:
     return label.strip().lower().replace(" ", "_").replace("/", "_")
 
@@ -133,10 +106,6 @@ def extract_treatment_from_sample(sample_name: str, ordered_treatments_norm):
                 return key
     return "unknown"
 
-
-# ============================================================
-# 3) Alpha metrics
-# ============================================================
 def shannon(counts: np.ndarray) -> float:
     x = counts[counts > 0]
     N = x.sum()
@@ -158,9 +127,6 @@ def simpson_concentration(counts: np.ndarray) -> float:
     return float(np.sum(p ** 2))
 
 
-# ============================================================
-# 4) PCoA
-# ============================================================
 def pcoa_manual(dist_vector, index_names):
     D = squareform(dist_vector)
     n = D.shape[0]
@@ -182,10 +148,6 @@ def pcoa_manual(dist_vector, index_names):
     cols = ["PC1", "PC2"] if k == 2 else ["PC1"]
     return pd.DataFrame(coords, index=index_names, columns=cols), eigvals
 
-
-# ============================================================
-# 5) PERMANOVA
-# ============================================================
 def permanova_test(dist_vector, groups, permutations=999, seed=123):
     groups = np.asarray(groups, dtype=object)
     uniq = np.unique(groups)
@@ -234,10 +196,6 @@ def permanova_test(dist_vector, groups, permutations=999, seed=123):
     p = (np.sum(F_perm >= F_obs) + 1) / (permutations + 1)
     return float(F_obs), float(p), permutations
 
-
-# ============================================================
-# 6) Post-hoc ONLY vs control + correction (Holm default)
-# ============================================================
 def pairwise_vs_control_wilcoxon(alpha_df, metric, control_group, group_col="group",
                                 mtc_method="holm", alpha=0.05):
     """
@@ -247,7 +205,7 @@ def pairwise_vs_control_wilcoxon(alpha_df, metric, control_group, group_col="gro
     """
     groups = alpha_df[group_col].astype(str).unique().tolist()
     if control_group not in groups:
-        print(f"⚠️ control_group='{control_group}' not found in groups: {groups}")
+        print(f" control_group='{control_group}' not found in groups: {groups}")
         return pd.DataFrame()
 
     ctrl = alpha_df.loc[alpha_df[group_col] == control_group, metric].dropna().values
@@ -266,7 +224,15 @@ def pairwise_vs_control_wilcoxon(alpha_df, metric, control_group, group_col="gro
             continue
 
         try:
-            W, p = ranksums(x, ctrl)  # two-sided by default
+            res = mannwhitneyu(
+                x,
+                ctrl,
+                alternative="two-sided",
+                method="exact"
+            )
+
+            W = res.statistic
+            p = res.pvalue  # two-sided by default
         except Exception:
             W, p = np.nan, np.nan
 
@@ -303,13 +269,13 @@ def pairwise_permanova_vs_control(dist_vector, groups, control_group,
     groups = np.asarray(groups, dtype=object)
     uniq = np.unique(groups)
     if control_group not in uniq:
-        print(f"⚠️ control_group='{control_group}' not found in: {list(uniq)}")
+        print(f" control_group='{control_group}' not found in: {list(uniq)}")
         return pd.DataFrame()
 
     D = squareform(dist_vector)
     idx_ctrl = np.where(groups == control_group)[0]
     if len(idx_ctrl) < 2:
-        print("⚠️ control group has <2 samples; cannot run vs-control PERMANOVA.")
+        print(" control group has <2 samples; cannot run vs-control PERMANOVA.")
         return pd.DataFrame()
 
     rows = []
@@ -379,9 +345,7 @@ def write_significant_report_vs_control(posthoc_dict, out_txt, header, mtc_metho
             f.write("No significant post-hoc vs-control comparisons at adjusted p < 0.05.\n")
 
 
-# ============================================================
-# 7) Abundance from YOUR CSV taxonomy format
-# ============================================================
+
 _BAD_TAXA = {
     "", "unknown", "uncultured", "uncultured_bacterium", "uncultured_organism",
     "metagenome", "freshwater_metagenome", "unidentified", "unclassified"
@@ -452,10 +416,24 @@ def taxa_palette(n):
             cols.append(next(cyc))
     return [to_hex(c) for c in cols[:n]]
 
+GLOBAL_TAXA_COLORS = {}
+
 def create_taxa_color_map(taxa_list):
-    pal = taxa_palette(len(taxa_list))
-    cmap = {t: pal[i] for i, t in enumerate(taxa_list)}
+
+    global GLOBAL_TAXA_COLORS
+
+    existing_colors = list(GLOBAL_TAXA_COLORS.values())
+
+    palette = taxa_palette(500)
+    palette_iter = iter([c for c in palette if c not in existing_colors])
+
+    for taxon in taxa_list:
+        if taxon not in GLOBAL_TAXA_COLORS:
+            GLOBAL_TAXA_COLORS[taxon] = next(palette_iter)
+
+    cmap = {t: GLOBAL_TAXA_COLORS[t] for t in taxa_list}
     cmap["Other/Unclassified"] = "#333333"
+
     return cmap
 
 def plot_stacked_individual_from_csv(df_rel_top: pd.DataFrame,
@@ -513,6 +491,8 @@ def plot_stacked_individual_from_csv(df_rel_top: pd.DataFrame,
                           boxstyle="round,pad=0.35"))
 
     plt.title(title)
+    ax = plt.gca()
+    ax.set_xlabel("")
     plt.tight_layout(rect=[0, 0.12, 1, 1])
     plt.savefig(out_png, bbox_inches="tight", dpi=300)
     plt.close()
@@ -521,7 +501,8 @@ def plot_stacked_mean_from_csv(df_rel_top: pd.DataFrame,
                                sample_to_group: dict,
                                ordered_treatments_norm: list,
                                out_png: str,
-                               title: str):
+                               title: str,
+                               taxa_cmap=None):
 
     df = df_rel_top.copy()
     df["treatment"] = df.index.map(lambda s: sample_to_group.get(s, "unknown"))
@@ -532,7 +513,9 @@ def plot_stacked_mean_from_csv(df_rel_top: pd.DataFrame,
     df_mean = df_mean.loc[tr_order + sorted(rest)]
 
     taxa_list = [c for c in df_mean.columns if c != "treatment"]
-    taxa_cmap = create_taxa_color_map(taxa_list)
+    if taxa_cmap is None:
+        taxa_cmap = create_taxa_color_map(taxa_list)
+
     colors = [taxa_cmap[t] for t in taxa_list]
 
     fig, ax = plt.subplots(figsize=(12, 8))
@@ -542,14 +525,26 @@ def plot_stacked_mean_from_csv(df_rel_top: pd.DataFrame,
     ax.set_xlabel("Treatment")
     ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", title="Taxa")
     plt.title(title)
+    ax = plt.gca()
+    ax.set_xlabel("")
     plt.tight_layout()
     plt.savefig(out_png, bbox_inches="tight", dpi=300)
     plt.close()
+    
+def create_shared_taxa_color_map(first_taxa_list, second_taxa_list):
+    shared_order = []
+
+    for t in first_taxa_list:
+        if t not in shared_order:
+            shared_order.append(t)
+
+    for t in second_taxa_list:
+        if t not in shared_order:
+            shared_order.append(t)
+
+    return create_taxa_color_map(shared_order)
 
 
-# ============================================================
-# 8) CSV loader robust to first-column name "sample"/"ample"/etc
-# ============================================================
 def load_matrix_csv(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
     first_col = df.columns[0]
@@ -559,9 +554,6 @@ def load_matrix_csv(path: str) -> pd.DataFrame:
     return df
 
 
-# ============================================================
-# 9) Core analysis for one matrix
-# ============================================================
 def analyze_dataset(matrix_csv,
                     out_dir,
                     label,
@@ -660,6 +652,8 @@ def analyze_dataset(matrix_csv,
                       color="black", jitter=True, size=5, alpha=0.7)
         plt.title(f"{label} - {metric.title()} (Kruskal–Wallis p={pval:.3g})")
         plt.xticks(rotation=45, ha="right")
+        ax = plt.gca()
+        ax.set_xlabel("")
         plt.tight_layout()
         plt.savefig(os.path.join(out_dir, f"{label}_alpha_{metric}.png"), dpi=300)
         plt.close()
@@ -747,6 +741,8 @@ def analyze_dataset(matrix_csv,
                                              markerfacecolor=c, markeredgecolor='black',
                                              markersize=10, label=g))
             plt.legend(handles=handles, bbox_to_anchor=(1.05, 1), loc="upper left", title="Treatment")
+            ax = plt.gca()
+            ax.set_xlabel("")
             plt.tight_layout()
             plt.savefig(os.path.join(out_dir, f"{label}_pcoa_{metric_name}.png"), dpi=300)
             plt.close()
@@ -781,18 +777,15 @@ def analyze_dataset(matrix_csv,
         f"Significant post-hoc comparisons (treatment vs control) with adjusted p < 0.05\n"
         f"Dataset: {label}\n"
         f"Control group: {control_group_norm}\n\n"
-        f"- Alpha: Shannon, Simpson concentration; global Kruskal–Wallis; post-hoc Wilcoxon rank-sum vs control only if global p<0.05\n"
+        f"- Alpha: Shannon, Simpson concentration; global Kruskal–Wallis; post-hoc Mann–Whitney U tests (two-sided) versus control only when the global test was significant (p<0.05)\n"
         f"- Beta: BrayCurtis (rel. abundance), Jaccard (presence/absence); global PERMANOVA; post-hoc PERMANOVA vs control only if global p<0.05\n"
         f"- Multiple-testing correction: {mtc_method} applied ONLY within each vs-control family (per metric)\n"
     )
     write_significant_report_vs_control(posthoc_vs_control, report_path, header, mtc_method=mtc_method)
 
-    print(f"\n[{label}] ✅ Done. Outputs: {out_dir}")
+    print(f"\n[{label}]  Done. Outputs: {out_dir}")
 
 
-# ============================================================
-# 10) MAIN
-# ============================================================
 def main():
     setup_publication_style()
 
