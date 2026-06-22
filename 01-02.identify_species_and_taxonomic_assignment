@@ -10,7 +10,7 @@ def calculate_reference_alignment_length(cigar: str) -> int:
     ops = _CIGAR_RE.findall(cigar)
     return sum(int(n) for n, op in ops if op in ('M', 'D', '=', 'X'))
 
-def exstract_AS(fields):
+def extract_AS(fields):
     for x in fields:
         if x.startswith('AS:i:'):
             try:
@@ -43,7 +43,7 @@ def normalize_full_taxonomy(raw_taxonomy: str):
         return "unknown;unknown;unknown;unknown;unknown;unknown;unknown"
     return ";".join(pad_taxonomy_to_7(raw_taxonomy))
 
-def generate:aggregation_key(full_taxonomy: str):
+def generate_aggregation_key(full_taxonomy: str):
     parts = [p.strip() for p in full_taxonomy.split(';') if p.strip() != '']
     if len(parts) < 7:
         return "unknown_unknown"
@@ -106,7 +106,7 @@ def better_hit(new_hit, old_hit, as_tolerance=500):
     if new_spec < old_spec:
         return False
 
-    return new_hit["lunghezza_ref"] > old_hit["lunghezza_ref"]
+    return new_hit["reference_length"] > old_hit["reference_length"]
 
 def process_sam_with_taxonomy(
     file_in,
@@ -118,7 +118,7 @@ def process_sam_with_taxonomy(
 ):
     best_hit_per_read = {}
     reads_cigar_zero = 0
-    reads_senza_AS = 0
+    reads_without_AS = 0
     unknown_tax_ids = 0
     unknown_tax_ids_seen = set()
 
@@ -156,7 +156,7 @@ def process_sam_with_taxonomy(
 
             new_hit = {
                 "AS": AS,
-                "lunghezza_ref": lunghezza_ref,
+                "reference_length": reference_length,
                 "ref_id": ref_id,
                 "raw_taxonomy": raw_taxonomy,
             }
@@ -165,27 +165,27 @@ def process_sam_with_taxonomy(
                 best_hit_per_read[read_id] = new_hit
             else:
                 old_hit = best_hit_per_read[read_id]
-                if hit_migliore(new_hit, old_hit):
+                if better_hit(new_hit, old_hit):
                     best_hit_per_read[read_id] = new_hit
 
     total_reads = len(best_hit_per_read)
     kept_reads = 0
     lost_reads = 0
-    reads_scartate_ids = []
+    discarded_read_ids = []
 
     aggregated_data = {}
     species_preferred_count = 0
 
     for read_id, hit in best_hit_per_read.items():
         AS = hit["AS"]
-        reference_length = hit["refence_length"]
+        reference_length = hit["reference_length"]
         ref_id = hit["ref_id"]
         raw_taxonomy = hit["raw_taxonomy"]
 
-        if not (min_len <= lunghezza_ref <= max_len):
+        if not (min_len <= reference_length <= max_len):
             lost_reads += 1
-            if len(reads_scartate_ids) < 2:
-                reads_scartate_ids.append(read_id)
+            if len(discarded_read_ids) < 2:
+                discarded_read_ids.append(read_id)
             continue
 
         kept_reads += 1
@@ -212,13 +212,13 @@ def process_sam_with_taxonomy(
     print(f" Kept reads (best-hit full-length): {kept_reads}")
     print(f" Reads lost by length: {lost_reads} "
     f"({(lost_reads / total_reads * 100 if total_reads else 0):.2f}%)")
-    print(f" Unaligned reads (CIGAR='*'): {reads_with_empty_cigar}")
+    print(f" Unaligned reads (CIGAR='*'): {reads_cigar_zero}")
     print(f" Reads without AS tag: {reads_without_AS}")
     print(f" ref_ids missing from taxonomy mapping: {len(unknown_tax_ids_seen)}")
     print(f" Final aggregated taxa: {len(aggregated_data)}")
     
     if discarded_read_ids:
-    print(f" First 2 discarded reads: {', '.join(discarded_read_ids)}")
+        print(f" First 2 discarded reads: {', '.join(discarded_read_ids)}")
     
     print("-" * 70)
 
@@ -230,16 +230,16 @@ parser = argparse.ArgumentParser(
         "taxonomy.txt output."
     )
 )
-parser.add_argument("input_dir", help="Directory radice")
+parser.add_argument("input_dir", help="Root directory")
 parser.add_argument(
     "--taxonomy_file",
     required=True,
-    help="File mapping ID -> tassonomia"
+    help="ID-to-taxonomy mapping file"
 )
 parser.add_argument(
     "--pattern",
     default="discarded.sam",
-    help="Suffisso dei file SAM filtrati (default: discarded.sam)"
+    help="Suffix of filtered SAM files to process (default: discarded.sam)"
 )
 parser.add_argument("--min_len", type=int, default=1200)
 parser.add_argument("--max_len", type=int, default=1800)
@@ -253,7 +253,7 @@ args = parser.parse_args()
 root = args.input_dir
 
 if not os.path.isdir(root):
-    print(f"Errore: '{root}' is not a directory.")
+    print(f"Error: '{root}' is not a directory.")
     raise SystemExit(1)
 
 tax_dict = load_taxonomy (args.taxonomy_file)
