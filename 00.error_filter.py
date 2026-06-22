@@ -4,7 +4,7 @@ import re
 import argparse
 
 # usage:
-#   python3 filtraggio_percentuale_errore_sam.py path/to/file.sam --max_error 0.02 --min_len 1300 --max_len 1700 --min_cov 0.90
+#   python3 00.error_filter.py path/to/file.sam --max_error 0.02 --min_len 1300 --max_len 1700 --min_cov 0.90
 
 _CIGAR_RE = re.compile(r'(\d+)([MIDNSHP=X])')
 
@@ -95,7 +95,7 @@ def filter_sam(input_file, output_file, max_error, min_len, max_len, min_cov):
             if error_rate <= max_error:
                 fout.write(line)
                 kept_alignments += 1
-                read_ids_kept.add(read_id)  # la read ha almeno un allineamento valido
+                read_ids_kept.add(read_id)  
             else:
                 lost_alignments += 1
                 lost_error += 1
@@ -165,7 +165,7 @@ if os.path.isfile(target_path) and target_path.endswith('.sam'):
 # Folder with SAM files
 elif os.path.isdir(target_path):
 
-    print(f"\n=== Scansione ricorsiva della cartella: {target_path} ===\n")
+    print(f"\n=== Recursively scanning directory: {target_path} ===\n")
 
     found = False
 
@@ -177,4 +177,4 @@ elif os.path.isdir(target_path):
                 process_one(input_path)
 
     if not found:
-        print("Nessun file .sam trovato nelle sottocartelle.")
+        print("No .sam files found in subdirectories.")
